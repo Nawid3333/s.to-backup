@@ -36,42 +36,43 @@ _MODE_LABELS = {
 
 
 def _check_checkpoint(expected_mode):
-    """Check for an existing checkpoint and ask to resume if it matches the current mode.
-    
-    Args:
-        expected_mode: The mode string for the current operation
-        
-    Returns:
-        bool: True if user wants to resume, False otherwise
+    """Check for an existing checkpoint and prompt the user to resume or discard.
+
+    Returns dict with 'ok' (proceed?) and 'resume' (resume from checkpoint?).
     """
     checkpoint_mode = SToBackupScraper.get_checkpoint_mode(DATA_DIR)
     if checkpoint_mode is None:
-        return False
-    
+        return {'ok': True, 'resume': False}
+
     checkpoint_file = os.path.join(DATA_DIR, '.scrape_checkpoint.json')
-    
+    saved_label = _MODE_LABELS.get(checkpoint_mode, checkpoint_mode)
+    expected_label = _MODE_LABELS.get(expected_mode, expected_mode)
+
     if checkpoint_mode == expected_mode:
-        label = _MODE_LABELS.get(checkpoint_mode, checkpoint_mode)
-        print(f"⚠ Checkpoint found from previous run: {label}\n")
+        print(f"\n⚠ Checkpoint found from a previous \"{saved_label}\" run!\n")
         choice = input("Resume from checkpoint? (y/n): ").strip().lower()
         if choice == 'y':
-            return True
-        # User declined resume — discard old checkpoint and start fresh
-        try:
-            os.remove(checkpoint_file)
-        except OSError:
-            pass
-        return False
+            return {'ok': True, 'resume': True}
+        # User declined resume — ask whether to discard
+        discard = input("Discard old checkpoint and start fresh? (y/n): ").strip().lower()
+        if discard == 'y':
+            try:
+                os.remove(checkpoint_file)
+            except OSError:
+                pass
+            return {'ok': True, 'resume': False}
+        return {'ok': False, 'resume': False}
     else:
-        # Checkpoint exists but from a different mode — discard and start fresh
-        label = _MODE_LABELS.get(checkpoint_mode, checkpoint_mode)
-        print(f"⚠ Checkpoint found from a different mode: {label}")
-        print("  Discarding old checkpoint and starting fresh.\n")
-        try:
-            os.remove(checkpoint_file)
-        except OSError:
-            pass
-        return False
+        print(f"\n⚠ A checkpoint exists from a different mode: \"{saved_label}\"")
+        print(f"   You are about to run: \"{expected_label}\"\n")
+        discard = input("Discard the old checkpoint and continue? (y/n): ").strip().lower()
+        if discard == 'y':
+            try:
+                os.remove(checkpoint_file)
+            except OSError:
+                pass
+            return {'ok': True, 'resume': False}
+        return {'ok': False, 'resume': False}
 
 # Configure logging
 logging.basicConfig(
@@ -240,7 +241,11 @@ def scrape_all_series():
     print("  (Browser will open - do not close it manually)\n")
     
     # Check for existing checkpoint from this mode
-    resume = _check_checkpoint('all_series')
+    chk = _check_checkpoint('all_series')
+    if not chk['ok']:
+        print("✗ Cancelled")
+        return
+    resume = chk['resume']
     
     print("\nScraping mode:")
     print("  1. Sequential (slower, but most reliable)")
@@ -266,7 +271,11 @@ def scrape_new_series():
     print("\n→ Starting S.TO scraper (NEW series only)...")
     print("  (Browser will open - do not close it manually)\n")
     
-    resume = _check_checkpoint('new_only')
+    chk = _check_checkpoint('new_only')
+    if not chk['ok']:
+        print("\u2717 Cancelled")
+        return
+    resume = chk['resume']
     
     _run_scrape_and_save(
         run_kwargs=dict(new_only=True, resume_only=resume),
@@ -347,7 +356,11 @@ def batch_add_from_file(file_path):
         return
     
     # Check for existing batch checkpoint
-    resume = _check_checkpoint('batch')
+    chk = _check_checkpoint('batch')
+    if not chk['ok']:
+        print("\u2717 Cancelled")
+        return
+    resume = chk['resume']
     
     if not resume:
         # Ask user for scraping mode
@@ -539,7 +552,11 @@ def scrape_subscribed_watchlist():
     print(f"\n  (Browser will open - do not close it manually)\n")
     
     output_file = SERIES_INDEX_S_TO_FILE
-    resume = _check_checkpoint(source)
+    chk = _check_checkpoint(source)
+    if not chk['ok']:
+        print("\u2717 Cancelled")
+        return
+    resume = chk['resume']
     
     scraper = None
     try:
@@ -609,7 +626,11 @@ def retry_failed_series():
     print("\n→ Retry failed series from last run")
     print("  (Browser will open - do not close it manually)\n")
     
-    resume = _check_checkpoint('retry')
+    chk = _check_checkpoint('retry')
+    if not chk['ok']:
+        print("\u2717 Cancelled")
+        return
+    resume = chk['resume']
     
     # Pre-check for failed series before launching browser
     temp_scraper = SToBackupScraper()

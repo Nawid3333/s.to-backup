@@ -463,11 +463,21 @@ class SToBackupScraper:
                 pass
     
     def save_failed_series(self):
-        """Save list of failed series for retry"""
+        """Save list of failed series for retry.
+        
+        Merges with any existing failed series from previous runs so no
+        failures are lost across multiple scraping sessions.
+        """
         if not self.failed_file or not self.failed_links:
             return
         try:
-            self._atomic_write_json(self.failed_file, self.failed_links)
+            existing = self.load_failed_series()
+            # Merge: index existing by URL, then overlay with new failures
+            merged = {item.get('url', ''): item for item in existing if isinstance(item, dict)}
+            for item in self.failed_links:
+                key = item.get('url', '') if isinstance(item, dict) else str(item)
+                merged[key] = item
+            self._atomic_write_json(self.failed_file, list(merged.values()))
         except Exception:
             pass
     
