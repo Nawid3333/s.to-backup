@@ -166,7 +166,23 @@ def print_completed_series_alerts(index_manager=None):
         print("─" * 70)
         print(f"→ {len(alert_series)} series fully watched but not subscribed or on your watchlist.")
         print("  Consider subscribing, adding to watchlist, or leaving as-is.")
-        print("⚠" * 35 + "\n")
+        print("⚠" * 35)
+
+        # Offer to rescrape these series
+        rescrape = input("\nRescrape these series to update Sub/WL status? (y/n): ").strip().lower()
+        if rescrape == 'y':
+            urls = [s.get('url') for s in alert_series if s.get('url')]
+            if not urls:
+                print("✗ No URLs found for these series")
+                return
+            print(f"\n→ Rescraping {len(urls)} completed series...")
+            print("  (Browser will open - do not close it manually)\n")
+            _run_scrape_and_save(
+                run_kwargs=dict(url_list=urls, parallel=False),
+                description=f"Rescrape completed series ({len(urls)})",
+                success_msg=f"Rescrape completed! {len(urls)} series updated.",
+                no_data_msg="No data scraped",
+            )
     except Exception as e:
         logger.error(f"Error printing completed series alerts: {e}")
 

@@ -107,15 +107,18 @@ def group_episodes_by_season(episode_list, new_data, prefix='[+]'):
     for (title, season), ep_nums in sorted(grouped.items()):
         series = new_data_dict.get(title, {})
         total_in_season, watched_in_season = _get_season_stats(series, season)
+        sub = '✓' if series.get('subscribed') else '✗'
+        wl = '✓' if series.get('watchlist') else '✗'
+        sub_wl = f" (Sub:{sub} WL:{wl})"
         if total_in_season > 0:
-            result.append(f"  {prefix} {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
+            result.append(f"  {prefix} {title} [{season}]: {watched_in_season}/{total_in_season} episodes{sub_wl}")
         else:
             for ep_num in sorted(ep_nums):
-                result.append(f"  {prefix} {title} {format_season_ep(season, ep_num)}")
+                result.append(f"  {prefix} {title} {format_season_ep(season, ep_num)}{sub_wl}")
     return result
 
 
-def print_changes(old_data, new_data):
+def detect_changes(old_data, new_data):
     """Detect changes between old and new data.
     Returns dict with change counts and details."""
     changes = {
@@ -180,8 +183,8 @@ def print_changes(old_data, new_data):
     return changes
 
 
-def display_changes(changes, include_unwatched=True, include_watched=True,
-                    include_subscription=True, include_watchlist=True, new_data=None):
+def show_changes(changes, include_unwatched=True, include_watched=True,
+                 include_subscription=True, include_watchlist=True, new_data=None):
     """Display changes with pagination and smart season grouping."""
     total = 0
     for k, v in changes.items():
@@ -213,7 +216,9 @@ def display_changes(changes, include_unwatched=True, include_watched=True,
             total = series.get('total_episodes', 0)
             season_labels = [str(sn.get('season', '?')) for sn in series.get('seasons', [])]
             season_info = f" [{','.join(season_labels)}]" if season_labels else ""
-            return f"  + {title}{season_info}: {watched}/{total} watched"
+            sub = '✓' if series.get('subscribed') else '✗'
+            wl = '✓' if series.get('watchlist') else '✗'
+            return f"  + {title}{season_info}: {watched}/{total} watched (Sub:{sub} WL:{wl})"
         paginate_list(changes["new_series"], format_new_series)
 
     if changes["new_episodes"]:
@@ -264,26 +269,34 @@ class IndexManager:
     
     def load_index(self):
         """Load existing series index from file"""
+        if not os.path.exists(self.index_file):
+            logger.info(f"No existing index found at {self.index_file}")
+            self.series_index = {}
+            return
         try:
-            if os.path.exists(self.index_file):
-                with open(self.index_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    if isinstance(data, list):
-                        self.series_index = {s.get('title'): s for s in data if s.get('title')}
-                    elif isinstance(data, dict):
-                        first_item = next(iter(data.values()), None)
-                        if first_item and isinstance(first_item, dict) and first_item.get('title'):
-                            self.series_index = data
-                        else:
-                            self.series_index = {item.get('title'): item for item in data.values()
-                                                 if isinstance(item, dict) and item.get('title')}
+            with open(self.index_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    self.series_index = {s.get('title'): s for s in data if s.get('title')}
+                elif isinstance(data, dict):
+                    first_item = next(iter(data.values()), None)
+                    if first_item and isinstance(first_item, dict) and first_item.get('title'):
+                        self.series_index = data
                     else:
-                        self.series_index = {}
-                print(f"[OK] Loaded {len(self.series_index)} series from index")
-                logger.info(f"Loaded index with {len(self.series_index)} series")
-            else:
-                logger.info(f"No existing index found at {self.index_file}")
-                self.series_index = {}
+                        self.series_index = {item.get('title'): item for item in data.values()
+                                             if isinstance(item, dict) and item.get('title')}
+                else:
+                    self.series_index = {}
+            print(f"[OK] Loaded {len(self.series_index)} series from index")
+            logger.info(f"Loaded index with {len(self.series_index)} series")
+        except json.JSONDecodeError as e:
+            print(f"[ERROR] Index file corrupted: {e}")
+            logger.error(f"Index file corrupted: {e}")
+            self.series_index = {}
+        except OSError as e:
+            print(f"[ERROR] Cannot read index file: {e}")
+            logger.error(f"Cannot read index file: {e}")
+            self.series_index = {}
         except Exception as e:
             print(f"[WARN] Error loading index: {e}")
             logger.error(f"Error loading index: {e}")
@@ -296,7 +309,9 @@ class IndexManager:
             _atomic_write_json(self.index_file, series_list)
             logger.info(f"Saved index with {len(self.series_index)} series")
         except Exception as e:
+            print(f"[ERROR] Failed to save index: {e}")
             logger.error(f"Error saving index: {e}")
+            raise
     
     def get_series_with_progress(self, sort_by='completion', reverse=False):
         """Get series with computed episode progress information"""
@@ -514,7 +529,7 @@ def confirm_and_save_changes(new_data, description, index_manager):
     else:
         new_dict = dict(new_data)
     
-    changes = print_changes(old_data, new_dict)
+    changes = detect_changes(old_data, new_dict)
     logger.info(f"Detected changes: { {k: len(v) for k, v in changes.items()} }")
     
     allow_watched = False
@@ -533,10 +548,13 @@ def confirm_and_save_changes(new_data, description, index_manager):
         for (title, season), ep_nums in grouped.items():
             series = new_dict.get(title)
             total_in_season, watched_in_season = _get_season_stats(series, season)
+            sub = '✓' if series and series.get('subscribed') else '✗'
+            wl = '✓' if series and series.get('watchlist') else '✗'
+            sub_wl = f" (Sub:{sub} WL:{wl})"
             if total_in_season > 0:
-                print(f"  [+] {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
+                print(f"  [+] {title} [{season}]: {watched_in_season}/{total_in_season} episodes{sub_wl}")
             else:
-                print(f"  [+] {title} [{season}]: {len(ep_nums)} episode(s)")
+                print(f"  [+] {title} [{season}]: {len(ep_nums)} episode(s){sub_wl}")
         print("-"*70)
         resp = input("\nAllow these episodes to be marked as WATCHED? (y/n): ").strip().lower()
         if resp == 'y':
@@ -557,10 +575,13 @@ def confirm_and_save_changes(new_data, description, index_manager):
         for (title, season), ep_nums in grouped.items():
             series = new_dict.get(title)
             total_in_season, watched_in_season = _get_season_stats(series, season)
+            sub = '✓' if series and series.get('subscribed') else '✗'
+            wl = '✓' if series and series.get('watchlist') else '✗'
+            sub_wl = f" (Sub:{sub} WL:{wl})"
             if total_in_season > 0:
-                print(f"  [!] {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
+                print(f"  [!] {title} [{season}]: {watched_in_season}/{total_in_season} episodes{sub_wl}")
             else:
-                print(f"  [!] {title} [{season}]: {len(ep_nums)} episode(s)")
+                print(f"  [!] {title} [{season}]: {len(ep_nums)} episode(s){sub_wl}")
         print("-"*70)
         resp = input("\nAllow these episodes to be marked as UNWATCHED? (y/n): ").strip().lower()
         if resp == 'y':
@@ -681,6 +702,9 @@ def confirm_and_save_changes(new_data, description, index_manager):
             }
         else:
             # New entry: build with proper field order
+            new_entry.setdefault('subscribed', False)
+            new_entry.setdefault('watchlist', False)
+            new_entry.setdefault('alt_titles', [])
             new_entry['added_date'] = datetime.now().isoformat()
             new_entry['status'] = 'active'
             seasons = new_entry.pop('seasons', [])
@@ -702,7 +726,7 @@ def confirm_and_save_changes(new_data, description, index_manager):
         return True
     
     # Display remaining changes (watched/unwatched/subscription/watchlist already handled above)
-    display_changes(changes, include_unwatched=False, include_watched=False,
+    show_changes(changes, include_unwatched=False, include_watched=False,
                     include_subscription=False, include_watchlist=False, new_data=new_dict)
     
     response = input(f"\nSave these changes? (y/n): ").strip().lower()

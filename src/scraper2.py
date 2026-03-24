@@ -108,8 +108,10 @@ def cleanup_geckodriver_processes():
                     )
                 except Exception:
                     pass
-            
-            # Remove the PID file
+        except Exception:
+            pass
+        # Always remove the PID file after cleanup attempt
+        try:
             os.remove(worker_pids_file)
         except Exception:
             pass
@@ -133,8 +135,7 @@ if sys.platform == 'win32':
     signal.signal(signal.SIGBREAK, _signal_handler)
 
 # Performance settings - Allow overriding via environment variable
-MAX_WORKERS = int(os.getenv("SO_MAX_WORKERS", "8"))  # Default to 8 workers (balances speed vs server load)
-USE_PARALLEL = os.getenv("SO_PARALLEL", "true").lower() in ('true', '1', 'yes')
+MAX_WORKERS = 16
 
 
 # Pre-compiled regex for season label detection
@@ -177,7 +178,7 @@ class SToBackupScraper:
         self.series_data = []
         self.auth_cookies = []
         self._lock = threading.Lock()
-        self._use_parallel = USE_PARALLEL
+        self._use_parallel = True
         self.checkpoint_file = os.path.join(DATA_DIR, '.scrape_checkpoint.json')
         self.failed_file = os.path.join(DATA_DIR, '.failed_series.json')
         self.pause_file = os.path.join(DATA_DIR, '.pause_scraping')
@@ -405,8 +406,9 @@ class SToBackupScraper:
             if include_data and self.series_data:
                 checkpoint_data['series_data'] = self.series_data
             self._atomic_write_json(self.checkpoint_file, checkpoint_data)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Failed to save checkpoint: {e}")
+            print(f"  ⚠ Warning: checkpoint save failed: {e}")
     
     def load_checkpoint(self):
         """Load checkpoint to resume from previous run.
@@ -450,8 +452,8 @@ class SToBackupScraper:
                 data = json.load(f)
             if isinstance(data, dict):
                 return data.get('mode')
-        except Exception:
-            pass
+        except (json.JSONDecodeError, OSError) as e:
+            logger.debug(f"Could not read checkpoint mode: {e}")
         return None
     
     def clear_checkpoint(self):
@@ -459,8 +461,8 @@ class SToBackupScraper:
         if self.checkpoint_file and os.path.exists(self.checkpoint_file):
             try:
                 os.remove(self.checkpoint_file)
-            except Exception:
-                pass
+            except OSError as e:
+                logger.debug(f"Could not remove checkpoint file: {e}")
     
     def save_failed_series(self):
         """Save list of failed series for retry.
@@ -478,28 +480,33 @@ class SToBackupScraper:
                 key = item.get('url', '') if isinstance(item, dict) else str(item)
                 merged[key] = item
             self._atomic_write_json(self.failed_file, list(merged.values()))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Failed to save failed series list: {e}")
+            print(f"  ⚠ Warning: could not save failed series list: {e}")
     
     def load_failed_series(self):
         """Load previously failed series for retry"""
         if not self.failed_file:
             return []
         try:
-            if os.path.exists(self.failed_file):
-                with open(self.failed_file, 'r', encoding='utf-8') as f:
-                    return json.load(f) or []
-        except Exception:
-            pass
-        return []
+            with open(self.failed_file, 'r', encoding='utf-8') as f:
+                return json.load(f) or []
+        except FileNotFoundError:
+            return []
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed series file corrupted, ignoring: {e}")
+            return []
+        except Exception as e:
+            logger.warning(f"Could not load failed series: {e}")
+            return []
     
     def clear_failed_series(self):
         """Clear failed series list after successful retry"""
         if self.failed_file and os.path.exists(self.failed_file):
             try:
                 os.remove(self.failed_file)
-            except Exception:
-                pass
+            except OSError as e:
+                logger.debug(f"Could not remove failed series file: {e}")
     
     def is_pause_requested(self):
         """Check if pause has been requested via pause file"""
@@ -510,8 +517,8 @@ class SToBackupScraper:
         if self.pause_file and os.path.exists(self.pause_file):
             try:
                 os.remove(self.pause_file)
-            except Exception:
-                pass
+            except OSError as e:
+                logger.debug(f"Could not remove pause file: {e}")
         
     # ==================== CONFIG HELPERS ====================
     
@@ -706,7 +713,32 @@ class SToBackupScraper:
     def setup_driver(self):
         """Initialize the Selenium WebDriver with anti-detection measures and aggressive ad-blocking"""
         firefox_options = self._build_firefox_options()
-        self.driver = webdriver.Firefox(options=firefox_options)
+        service = FirefoxService()
+        self.driver = webdriver.Firefox(service=service, options=firefox_options)
+        
+        # Track main driver PID (worker_id=0) so sequential mode is visible
+        # in 'show active workers' and cleaned up on hard-kill
+        try:
+            if hasattr(service, 'process') and service.process:
+                geckodriver_pid = service.process.pid
+                if geckodriver_pid:
+                    self.save_worker_pid(0, geckodriver_pid)
+                    # Also track the Firefox child process
+                    try:
+                        result = subprocess.run(
+                            ['wmic', 'process', 'where', f'ParentProcessId={geckodriver_pid}',
+                             'get', 'ProcessId', '/value'],
+                            capture_output=True, text=True, timeout=2, check=False
+                        )
+                        for line in result.stdout.split('\n'):
+                            if 'ProcessId' in line:
+                                firefox_pid = line.split('=')[-1].strip()
+                                if firefox_pid.isdigit():
+                                    self.save_worker_pid('0_firefox', int(firefox_pid))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         
         # Execute JavaScript to hide webdriver flag and inject stealth properties
         try:
@@ -1360,6 +1392,14 @@ class SToBackupScraper:
 
     # ==================== SERIES & EPISODE SCRAPING ====================
     
+    # Patterns that reliably identify HTTP error pages by their <title>.
+    # Matches titles like "404", "404 Nicht gefunden", "Error 404", "404 Not Found"
+    # but NOT series names that happen to contain digits (e.g. "Apartment404").
+    _ERROR_TITLE_RE = re.compile(
+        r'^(?:Error\s+)?(?P<code>\d{3})\b|\b(?:Error|Fehler)\s+(?P<code2>\d{3})\b',
+        re.IGNORECASE,
+    )
+
     def check_series_not_found_error(self, html):
         """Check if page contains error message for series not found.
         Returns error message if found, None otherwise."""
@@ -1370,43 +1410,53 @@ class SToBackupScraper:
             error_text = error_div.get_text(strip=True)
             if 'nicht gefunden' in error_text.lower():
                 return error_text
-        # Check for standalone 404 page (title "404 Nicht gefunden" or <h2>404</h2>)
+        # Check for standalone 404 page by <title> – only match if the title
+        # starts with "404" or contains "Error 404", not a series name.
         title_tag = soup.find('title')
-        if title_tag and '404' in title_tag.get_text():
-            return title_tag.get_text(strip=True)
+        if title_tag:
+            title_text = title_tag.get_text(strip=True)
+            m = self._ERROR_TITLE_RE.search(title_text)
+            if m:
+                code = m.group('code') or m.group('code2')
+                if code == '404':
+                    return title_text
+        # Check for <h2>404</h2> (exact match, safe from series names)
         h2_tag = soup.find('h2')
         if h2_tag and h2_tag.get_text(strip=True) == '404':
             p_tag = soup.find('p')
             return p_tag.get_text(strip=True) if p_tag else '404 Nicht gefunden'
         return None
 
+    # Map of HTTP error codes to their standard reason phrases.
+    _SERVER_ERROR_CODES = {
+        '429': '429 Too Many Requests',
+        '500': '500 Internal Server Error',
+        '502': '502 Bad Gateway',
+        '503': '503 Service Unavailable',
+        '504': '504 Gateway Timeout',
+    }
+
     def check_server_error(self, html):
         """Check if page contains a server error (429, 500, 502, 503, 504, etc.).
         Returns error message if found, None otherwise."""
         soup = BeautifulSoup(html, 'html.parser')
+        # Check <title> for error-page patterns (e.g. "502 Bad Gateway", "Error 503")
         title_tag = soup.find('title')
         if title_tag:
             title_text = title_tag.get_text(strip=True)
-            if '429' in title_text:
-                return '429 Too Many Requests'
-            if 'Error 502' in title_text or '502' in title_text:
-                return '502 Bad Gateway'
-            if 'Error 503' in title_text or '503' in title_text:
-                return '503 Service Unavailable'
-            if 'Error 500' in title_text or '500' in title_text:
-                return '500 Internal Server Error'
-            if 'Error 504' in title_text or '504' in title_text:
-                return '504 Gateway Timeout'
+            m = self._ERROR_TITLE_RE.search(title_text)
+            if m:
+                code = m.group('code') or m.group('code2')
+                if code in self._SERVER_ERROR_CODES:
+                    return self._SERVER_ERROR_CODES[code]
         # Also check for common error patterns in the page body
+        # These require BOTH the code AND the reason phrase, so false positives
+        # from series names are extremely unlikely.
         body_text = soup.get_text(strip=True) if soup.body else ''
-        if '429' in body_text and 'Too Many Requests' in body_text:
-            return '429 Too Many Requests'
-        if '502' in body_text and 'Bad Gateway' in body_text:
-            return '502 Bad Gateway'
-        if '500' in body_text and 'Internal Server Error' in body_text:
-            return '500 Internal Server Error'
-        if '504' in body_text and 'Gateway Timeout' in body_text:
-            return '504 Gateway Timeout'
+        for code, message in self._SERVER_ERROR_CODES.items():
+            reason = message.split(' ', 1)[1]  # e.g. "Too Many Requests"
+            if code in body_text and reason in body_text:
+                return message
         return None
     
     def scrape_series_detail(self, series_url, driver=None, max_retries=3):
@@ -1774,9 +1824,6 @@ class SToBackupScraper:
                 raise SeasonDetectionError(
                     f"Season detection failed for {series_slug} after {max_retries} attempts: {last_error}"
                 )
-        
-        # Should not reach here, but just in case
-        raise SeasonDetectionError(f"Season detection failed for {series_slug}: {last_error}")
 
     # ==================== MAIN SCRAPING ORCHESTRATION ====================
     
@@ -1842,8 +1889,8 @@ class SToBackupScraper:
                 os.makedirs(DATA_DIR, exist_ok=True)
                 with open(pids_file, 'w') as f:
                     json.dump(pids, f)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Failed to save worker PID {worker_id}: {e}")
 
     def clear_worker_pids(self):
         """Clear tracked worker PIDs after scraping completes."""
@@ -1852,8 +1899,8 @@ class SToBackupScraper:
             try:
                 if os.path.exists(pids_file):
                     os.remove(pids_file)
-            except Exception:
-                pass
+            except OSError as e:
+                logger.debug(f"Could not remove worker PIDs file: {e}")
     
     def _authenticate_driver(self, driver, label=None, max_attempts=3):
         """Authenticate a worker driver via cookies or full login.
@@ -1912,7 +1959,8 @@ class SToBackupScraper:
                     })
                 except Exception:
                     continue
-            driver.get(self.get_site_url())
+            # Refresh to apply cookies (don't navigate again, just reload)
+            driver.refresh()
             self._wait_for_page_ready(driver)
             return True
         except Exception:
@@ -2089,7 +2137,13 @@ class SToBackupScraper:
             health_every = int(self.get_timing('health_check_every') or 15)
             restart_threshold = int(self.get_timing('error_restart_threshold') or 8)
             
-            driver = self._create_worker_driver(worker_id)
+            driver = None
+            try:
+                driver = self._create_worker_driver(worker_id)
+            except Exception as e:
+                logger.error(f"Worker #{worker_id}: failed to create driver: {e}")
+                print(f"  ✗ Worker #{worker_id}: Failed to create browser: {str(e)[:80]}")
+                return
             self.inject_aggressive_adblock(driver)
             
             # Authenticate worker: try cookies first, fall back to full login
@@ -2626,8 +2680,6 @@ class SToBackupScraper:
             self._use_parallel = parallel
             mode_str = "parallel" if parallel else "sequential"
             print(f"→ Using {mode_str} mode")
-        else:
-            self._use_parallel = USE_PARALLEL
 
         try:
             self.setup_driver()
