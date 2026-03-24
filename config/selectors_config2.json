@@ -1,0 +1,66 @@
+{
+  "site_url": "https://s.to",
+  "login_page": "https://s.to/login",
+  "account_page": "https://s.to/account",
+  "selectors": {
+    "login": {
+      "username_field": [
+        { "type": "css", "value": "input#email" },
+        { "type": "css", "value": "input[type='email']" },
+        { "type": "css", "value": "input[name='email']" },
+        { "type": "css", "value": "input.form-control[type='email']" }
+      ],
+      "password_field": [
+        { "type": "css", "value": "input#password" },
+        { "type": "css", "value": "input[type='password']" },
+        { "type": "css", "value": "input[name='password']" },
+        { "type": "css", "value": "input.form-control[type='password']" }
+      ],
+      "submit_button": [
+        { "type": "css", "value": "button[type='submit']" },
+        { "type": "css", "value": "input[type='submit']" },
+        { "type": "css", "value": "button.btn-primary" },
+        { "type": "css", "value": "button.btn" }
+      ]
+    },
+    "series_detail": {
+      "episode_rows": ".episode-table tbody tr.episode-row",
+      "episode_number": "th.episode-number-cell",
+      "title_ger": ".episode-title-ger",
+      "title_eng": ".episode-title-eng",
+      "watched_class": "seen",
+      "series_title": "h1.fw-bold",
+      "description": ".series-description .description-text"
+    },
+    "subscription": {
+      "action_button": ".js-action-btn",
+      "active_class": "btn-glass-primary",
+      "type_subscribed": "favorite",
+      "type_watchlist": "watchlater"
+    },
+    "season_nav": {
+      "pills": "#season-nav a[data-season-pill]",
+      "pill_attribute": "data-season-pill"
+    },
+    "account_pages": {
+      "subscribed": "/account/subscribed",
+      "watchlist": "/account/watchlist"
+    },
+    "series_index": {
+      "path": "/serien"
+    }
+  },
+  "timing": {
+    "page_load_delay": 0.5,
+    "initial_delay": 0.5,
+    "timeout": 15,
+    "success_delay": 0.8,
+    "error_backoff_base": 2.0,
+    "error_backoff_max": 15.0,
+    "min_request_interval": 0.25,
+    "health_check_every": 15,
+    "error_restart_threshold": 8,
+    "max_retries_season": 3,
+    "max_retries_retry": 5
+  }
+}
