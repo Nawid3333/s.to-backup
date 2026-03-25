@@ -88,6 +88,8 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+# Suppress urllib3 retry noise — these flood the console when geckodriver is killed externally
+logging.getLogger('urllib3').setLevel(logging.ERROR)
 
 logger = logging.getLogger(__name__)
 

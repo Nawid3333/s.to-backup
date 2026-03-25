@@ -2260,7 +2260,13 @@ class SToBackupScraper:
                 if not self._is_driver_alive(drv):
                     logger.error(f"{series_slug}: Driver died before season {season} — skipping remaining seasons")
                     break
-                
+
+                # Per-season auth check: catch session expiry before navigating
+                if not self._has_auth_cookies(drv):
+                    if not self.is_logged_in(drv):
+                        logger.warning(f"{series_slug}: Session expired before season {season} — re-authenticating")
+                        self._authenticate_driver(drv, label=f"season-{season}", max_attempts=2)
+
                 data = self.scrape_series_detail(season_url, drv, max_retries=max_retries,
                                                  skip_subscription=_sub_confirmed)
                 if data and data.get('total_episodes', 0) > 0:
