@@ -170,14 +170,14 @@ main2.py                        Entry point: menu, credential check, disk-space 
 
 ## Data Output
 
-| File                           | Description                                         |
-| ------------------------------ | --------------------------------------------------- |
-| `data/series_index.json`       | Primary persistent index of all scraped series      |
-| `data/series_index_s_to.json`  | s.to-specific output (same schema)                  |
-| `data/.scrape_checkpoint.json` | Resume state (deleted automatically on success)     |
-| `data/.failed_series.json`     | Failed series list (cleared after successful retry) |
-| `data/.worker_pids.json`       | PIDs of running workers (used by Option 8)          |
-| `logs/s_to_backup.log`         | Rotating log file — 10 MB max, 5 backups kept       |
+| File                           | Description                                                                     |
+| ------------------------------ | ------------------------------------------------------------------------------- |
+| `data/series_index.json`       | Primary persistent index of all scraped series                                  |
+| `data/series_index_s_to.json`  | s.to-specific output (same schema)                                              |
+| `data/.scrape_checkpoint.json` | Resume state (deleted automatically on success)                                 |
+| `data/.failed_series.json`     | Failed series list (cleared after successful retry)                             |
+| `data/.worker_pids_<pid>.json` | PIDs of running workers for this process (auto-cleaned on exit or next startup) |
+| `logs/s_to_backup.log`         | Rotating log file — 10 MB max, 5 backups kept                                   |
 
 ### Series entry schema
 
@@ -220,6 +220,8 @@ Options 1, 2, and 5 offer a **parallel mode** that spawns multiple Firefox worke
 - **Option 7** (Pause) creates a flag file that tells all workers to stop at their next checkpoint — data scraped so far is saved
 - **Option 8** (Show workers) lists running PIDs and offers a force-kill if needed
 
+> ⚠️ **One scraping instance at a time.** Only one terminal should run a scrape (options 1–3, 5, 6) at any given time. Running two simultaneous scrapes against the same `data/` folder will cause them to overwrite each other’s checkpoint and series index. Use a second terminal **only** for option 7 (pause) or option 8 (show workers) — both are read-only or signal-only operations that are safe to run alongside a live scrape.
+
 For small lists (< 5 series), sequential mode is equally fast and more reliable.
 
 ---
@@ -249,7 +251,8 @@ For small lists (< 5 series), sequential mode is equally fast and more reliable.
 **Parallel workers not stopping after Ctrl+C**
 
 - Use Option 7 to create a pause file, then Option 8 to view and kill worker PIDs
-- All Firefox + geckodriver PIDs are tracked in `data/.worker_pids.json`
+- Each process tracks its own PIDs in `data/.worker_pids_<pid>.json`; stale files from a hard-killed terminal are cleaned up automatically on the next startup
+- If you need to clean up immediately, use Option 8 → kill all workers
 
 **Low disk space warning at startup**
 

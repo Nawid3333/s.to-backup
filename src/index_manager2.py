@@ -4,11 +4,15 @@ Manages the persistent series index and handles data merging, change detection, 
 Ported from Save bs.to with s.to-specific extensions (subscription/watchlist tracking).
 """
 
+import hashlib
 import json
 import logging
 import os
 import re
+import shutil
 import tempfile
+import threading
+import time
 from collections import defaultdict
 from datetime import datetime
 
@@ -18,13 +22,114 @@ logger = logging.getLogger(__name__)
 _SEASON_NUMBER_RE = re.compile(r'(staffel|season|s)\s*(\d+)', re.IGNORECASE)
 
 
+class FileLock:
+    """Simple file-based lock for preventing concurrent access to critical files.
+    
+    Uses a .lock file to indicate exclusive access. Waits for lock with timeout.
+    Works cross-platform (Windows, Linux, Mac).
+    """
+    def __init__(self, filepath, timeout=10, poll_interval=0.1):
+        self.filepath = filepath
+        self.lock_file = filepath + '.lock'
+        self.timeout = timeout
+        self.poll_interval = poll_interval
+        self.lock_acquired = False
+    
+    def acquire(self):
+        """Acquire lock, waiting up to timeout seconds."""
+        start = time.time()
+        while time.time() - start < self.timeout:
+            try:
+                # Try to create lock file exclusively (atomic on most filesystems)
+                fd = os.open(self.lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, f"{os.getpid()}\n".encode())
+                os.close(fd)
+                self.lock_acquired = True
+                return True
+            except (OSError, FileExistsError):
+                time.sleep(self.poll_interval)
+        
+        logger.warning(f"Could not acquire lock on {self.filepath} after {self.timeout}s")
+        return False
+    
+    def release(self):
+        """Release lock by removing lock file."""
+        if self.lock_acquired:
+            try:
+                os.remove(self.lock_file)
+                self.lock_acquired = False
+            except OSError:
+                pass
+    
+    def __enter__(self):
+        self.acquire()
+        return self
+    
+    def __exit__(self, *args):
+        self.release()
+
+
+def _compute_file_checksum(filepath):
+    """Compute SHA256 checksum of a file for corruption detection."""
+    try:
+        sha256_hash = hashlib.sha256()
+        with open(filepath, 'rb') as f:
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
+    except Exception as e:
+        logger.warning(f"Could not compute checksum for {filepath}: {e}")
+        return None
+
+
+def _create_file_backup(filepath):
+    """Create a backup of a file (up to 3 generations kept)."""
+    if not os.path.exists(filepath):
+        return
+    try:
+        backup_dir = os.path.dirname(filepath)
+        filename = os.path.basename(filepath)
+        
+        # Remove oldest backup if 3 already exist
+        for i in range(3, 10):
+            old_backup = os.path.join(backup_dir, f"{filename}.bak{i}")
+            if os.path.exists(old_backup):
+                try:
+                    os.remove(old_backup)
+                except OSError:
+                    pass
+        
+        # Shift existing backups: .bak2 -> .bak3, .bak1 -> .bak2, original -> .bak1
+        for i in range(2, 0, -1):
+            src = os.path.join(backup_dir, f"{filename}.bak{i}")
+            dst = os.path.join(backup_dir, f"{filename}.bak{i+1}")
+            if os.path.exists(src):
+                try:
+                    shutil.move(src, dst)
+                except OSError:
+                    pass
+        
+        # Create new backup
+        backup_path = os.path.join(backup_dir, f"{filename}.bak1")
+        shutil.copy2(filepath, backup_path)
+        logger.debug(f"Created backup: {backup_path}")
+    except Exception as e:
+        logger.warning(f"Could not create backup of {filepath}: {e}")
+
+
 def _atomic_write_json(filepath, data):
     """Write JSON to file atomically via temp file + os.replace.
     
+    Creates backup before writing to prevent data loss on corruption.
     Prevents corrupted files if the process is killed mid-write.
     """
     dirpath = os.path.dirname(filepath)
     os.makedirs(dirpath, exist_ok=True)
+    
+    # Create backup of existing file before overwriting
+    if os.path.exists(filepath):
+        _create_file_backup(filepath)
+    
     fd, tmp_path = tempfile.mkstemp(dir=dirpath, suffix='.tmp')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -127,11 +232,14 @@ def detect_changes(old_data, new_data):
         "newly_watched": [],
         "newly_unwatched": [],
         "subscription_changed": [],
-        "watchlist_changed": []
+        "watchlist_changed": [],
+        "title_ger_changed": [],
+        "title_eng_changed": []
     }
     
-    old_titles = set(old_data.keys()) if isinstance(old_data, dict) else {s.get('title') for s in old_data}
-    new_titles = set(new_data.keys()) if isinstance(new_data, dict) else {s.get('title') for s in new_data}
+    # Filter out None titles to avoid set issues
+    old_titles = set(old_data.keys()) if isinstance(old_data, dict) else {s.get('title') for s in old_data if s.get('title')}
+    new_titles = set(new_data.keys()) if isinstance(new_data, dict) else {s.get('title') for s in new_data if s.get('title')}
     
     if isinstance(old_data, list):
         old_data = {s.get('title'): s for s in old_data}
@@ -158,6 +266,18 @@ def detect_changes(old_data, new_data):
         new_wl = new_series.get('watchlist', False)
         if old_wl != new_wl:
             changes["watchlist_changed"].append((title, old_wl, new_wl))
+        
+        # Title German changes
+        old_ger = old_series.get('title_ger', '')
+        new_ger = new_series.get('title_ger', '')
+        if old_ger and new_ger and old_ger != new_ger:
+            changes["title_ger_changed"].append((title, old_ger, new_ger))
+        
+        # Title English changes
+        old_eng = old_series.get('title_eng', '')
+        new_eng = new_series.get('title_eng', '')
+        if old_eng and new_eng and old_eng != new_eng:
+            changes["title_eng_changed"].append((title, old_eng, new_eng))
         
         old_eps = {}
         for season in old_series.get('seasons', []):
@@ -254,64 +374,103 @@ def show_changes(changes, include_unwatched=True, include_watched=True,
             lambda x: f"  [~] {x[0]}: {'added to watchlist' if x[2] else 'removed from watchlist'}"
         )
 
+    if changes.get("title_ger_changed"):
+        print(f"\n[GERMAN TITLE CHANGED] ({len(changes['title_ger_changed'])} series)")
+        paginate_list(
+            changes["title_ger_changed"],
+            lambda x: f"  [~] {x[0]}: '{x[1]}' → '{x[2]}'"
+        )
+
+    if changes.get("title_eng_changed"):
+        print(f"\n[ENGLISH TITLE CHANGED] ({len(changes['title_eng_changed'])} series)")
+        paginate_list(
+            changes["title_eng_changed"],
+            lambda x: f"  [~] {x[0]}: '{x[1]}' → '{x[2]}'"
+        )
+
     print("\n" + "="*70)
     return total
 
 
 class IndexManager:
-    """Manages persistent series index for s.to"""
+    """Manages persistent series index for s.to with file locking"""
     
     def __init__(self, index_file):
         """Initialize index manager with path to index file"""
         self.index_file = index_file
         self.series_index = {}
+        self.file_lock = FileLock(index_file, timeout=10)  # 10-second lock timeout
         self.load_index()
     
     def load_index(self):
-        """Load existing series index from file"""
-        if not os.path.exists(self.index_file):
-            logger.info(f"No existing index found at {self.index_file}")
-            self.series_index = {}
-            return
-        try:
-            with open(self.index_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    self.series_index = {s.get('title'): s for s in data if s.get('title')}
-                elif isinstance(data, dict):
-                    first_item = next(iter(data.values()), None)
-                    if first_item and isinstance(first_item, dict) and first_item.get('title'):
-                        self.series_index = data
+        """Load existing series index from file with corruption detection and file locking"""
+        with self.file_lock:
+            if not os.path.exists(self.index_file):
+                logger.info(f"No existing index found at {self.index_file}")
+                self.series_index = {}
+                return
+            try:
+                with open(self.index_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        self.series_index = {s.get('title'): s for s in data if s.get('title') and isinstance(s, dict)}
+                    elif isinstance(data, dict):
+                        first_item = next(iter(data.values()), None)
+                        if first_item and isinstance(first_item, dict) and first_item.get('title'):
+                            self.series_index = data
+                        else:
+                            self.series_index = {item.get('title'): item for item in data.values()
+                                                 if isinstance(item, dict) and item.get('title')}
                     else:
-                        self.series_index = {item.get('title'): item for item in data.values()
-                                             if isinstance(item, dict) and item.get('title')}
-                else:
-                    self.series_index = {}
-            print(f"[OK] Loaded {len(self.series_index)} series from index")
-            logger.info(f"Loaded index with {len(self.series_index)} series")
-        except json.JSONDecodeError as e:
-            print(f"[ERROR] Index file corrupted: {e}")
-            logger.error(f"Index file corrupted: {e}")
-            self.series_index = {}
-        except OSError as e:
-            print(f"[ERROR] Cannot read index file: {e}")
-            logger.error(f"Cannot read index file: {e}")
-            self.series_index = {}
-        except Exception as e:
-            print(f"[WARN] Error loading index: {e}")
-            logger.error(f"Error loading index: {e}")
-            self.series_index = {}
+                        self.series_index = {}
+                    
+                    # Validate each loaded series has required fields
+                    validated_index = {}
+                    for title, series in self.series_index.items():
+                        if not isinstance(series, dict):
+                            logger.warning(f"Skipping invalid series entry (not dict): {title}")
+                            continue
+                        # Check for critical fields
+                        if not series.get('url'):
+                            logger.warning(f"Skipping series '{title}' - missing 'url' field")
+                            continue
+                        if not isinstance(series.get('seasons'), list):
+                            logger.warning(f"Skipping series '{title}' - 'seasons' must be list, got {type(series.get('seasons'))}")  
+                            continue
+                        validated_index[title] = series
+                    
+                    self.series_index = validated_index
+                    
+                    # Check that loaded data is not empty
+                    if not self.series_index:
+                        logger.warning("Loaded index is empty or contains no valid series")
+                    
+                print(f"[OK] Loaded {len(self.series_index)} series from index")
+                logger.info(f"Loaded index with {len(self.series_index)} series")
+            except json.JSONDecodeError as e:
+                print(f"[ERROR] Index file corrupted: {e}")
+                logger.error(f"Index file corrupted: {e}")
+                self.series_index = {}
+            except OSError as e:
+                print(f"[ERROR] Cannot read index file: {e}")
+                logger.error(f"Cannot read index file: {e}")
+                self.series_index = {}
+            except Exception as e:
+                print(f"[WARN] Error loading index: {e}")
+                logger.error(f"Error loading index: {e}")
+                self.series_index = {}
     
     def save_index(self):
-        """Save series index to file atomically to prevent corruption"""
-        try:
-            series_list = list(self.series_index.values())
-            _atomic_write_json(self.index_file, series_list)
-            logger.info(f"Saved index with {len(self.series_index)} series")
-        except Exception as e:
-            print(f"[ERROR] Failed to save index: {e}")
-            logger.error(f"Error saving index: {e}")
-            raise
+        """Save series index to file atomically with file locking to prevent corruption"""
+        with self.file_lock:
+            try:
+                series_list = list(self.series_index.values())
+                _atomic_write_json(self.index_file, series_list)
+                logger.info(f"Saved index with {len(self.series_index)} series")
+            except Exception as e:
+                print(f"[ERROR] Failed to save index: {e}")
+                logger.error(f"Error saving index: {e}")
+                raise
     
     def get_series_with_progress(self, sort_by='completion', reverse=False):
         """Get series with computed episode progress information"""
@@ -536,6 +695,8 @@ def confirm_and_save_changes(new_data, description, index_manager):
     allow_unwatched = False
     allow_subscription = False
     allow_watchlist = False
+    allow_title_ger = False
+    allow_title_eng = False
     
     # Confirm watched (unwatched -> watched)
     if changes['newly_watched']:
@@ -625,6 +786,42 @@ def confirm_and_save_changes(new_data, description, index_manager):
             print("  -> Watchlist changes will be ignored")
             logger.info("User denied watchlist changes.")
     
+    # Confirm title_ger changes
+    if changes['title_ger_changed']:
+        print(f"\n[~] {len(changes['title_ger_changed'])} German title(s) changed")
+        print("   (manual confirmation required)")
+        print("\n" + "-"*70)
+        for title, old_val, new_val in changes['title_ger_changed']:
+            print(f"  [~] {title}")
+            print(f"      Old: {old_val}")
+            print(f"      New: {new_val}")
+        print("-"*70)
+        resp = input("\nAllow German title changes? (y/n): ").strip().lower()
+        if resp == 'y':
+            allow_title_ger = True
+            logger.info("User allowed German title changes.")
+        else:
+            print("  -> German title changes will be ignored")
+            logger.info("User denied German title changes.")
+    
+    # Confirm title_eng changes
+    if changes['title_eng_changed']:
+        print(f"\n[~] {len(changes['title_eng_changed'])} English title(s) changed")
+        print("   (manual confirmation required)")
+        print("\n" + "-"*70)
+        for title, old_val, new_val in changes['title_eng_changed']:
+            print(f"  [~] {title}")
+            print(f"      Old: {old_val}")
+            print(f"      New: {new_val}")
+        print("-"*70)
+        resp = input("\nAllow English title changes? (y/n): ").strip().lower()
+        if resp == 'y':
+            allow_title_eng = True
+            logger.info("User allowed English title changes.")
+        else:
+            print("  -> English title changes will be ignored")
+            logger.info("User denied English title changes.")
+    
     # Clear disallowed changes
     if not allow_watched:
         changes['newly_watched'] = []
@@ -634,6 +831,10 @@ def confirm_and_save_changes(new_data, description, index_manager):
         changes['subscription_changed'] = []
     if not allow_watchlist:
         changes['watchlist_changed'] = []
+    if not allow_title_ger:
+        changes['title_ger_changed'] = []
+    if not allow_title_eng:
+        changes['title_eng_changed'] = []
     
     # Build merged data preserving old entries
     merged = dict(old_data)
@@ -663,6 +864,7 @@ def confirm_and_save_changes(new_data, description, index_manager):
                     old_seasons[season_label] = new_season
             old_entry['seasons'] = list(old_seasons.values())
             # Recalculate counts from actual episode data
+            old_entry['total_seasons'] = len(old_entry['seasons'])
             old_entry['watched_episodes'] = sum(
                 sum(1 for ep in s.get('episodes', []) if ep.get('watched'))
                 for s in old_entry['seasons']
@@ -671,12 +873,17 @@ def confirm_and_save_changes(new_data, description, index_manager):
                 len(s.get('episodes', []))
                 for s in old_entry['seasons']
             )
+            old_entry['unwatched_episodes'] = old_entry['total_episodes'] - old_entry['watched_episodes']
             old_entry['url'] = new_entry.get('url', old_entry.get('url'))
             old_entry['link'] = new_entry.get('link', old_entry.get('link'))
             if allow_subscription and 'subscribed' in new_entry:
                 old_entry['subscribed'] = new_entry['subscribed']
             if allow_watchlist and 'watchlist' in new_entry:
                 old_entry['watchlist'] = new_entry['watchlist']
+            if allow_title_ger and 'title_ger' in new_entry:
+                old_entry['title_ger'] = new_entry['title_ger']
+            if allow_title_eng and 'title_eng' in new_entry:
+                old_entry['title_eng'] = new_entry['title_eng']
             # Merge alt_titles: combine old + new, deduplicate, preserve order
             old_alts = old_entry.get('alt_titles', [])
             new_alts = new_entry.get('alt_titles', [])
@@ -696,7 +903,6 @@ def confirm_and_save_changes(new_data, description, index_manager):
                 'watched_episodes': old_entry.get('watched_episodes', 0),
                 'empty': old_entry.get('empty', False),
                 'added_date': old_entry.get('added_date', ''),
-                'status': old_entry.get('status', 'active'),
                 'last_updated': old_entry.get('last_updated', ''),
                 'seasons': old_entry.get('seasons', []),
             }
@@ -706,7 +912,6 @@ def confirm_and_save_changes(new_data, description, index_manager):
             new_entry.setdefault('watchlist', False)
             new_entry.setdefault('alt_titles', [])
             new_entry['added_date'] = datetime.now().isoformat()
-            new_entry['status'] = 'active'
             seasons = new_entry.pop('seasons', [])
             new_entry['seasons'] = seasons
             merged[title] = new_entry

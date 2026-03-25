@@ -5,6 +5,7 @@ Load credentials from .env file and site-specific selectors
 
 import os
 import json
+import warnings
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -43,32 +44,41 @@ def load_selectors_config():
     try:
         with open(SELECTORS_CONFIG_FILE, 'r', encoding='utf-8') as f:
             config = json.load(f)
-            print(f"✓ Loaded selectors from {SELECTORS_CONFIG_FILE}")
             return config
     except FileNotFoundError:
-        print(f"⚠ Selectors config not found: {SELECTORS_CONFIG_FILE}")
+        warnings.warn(f"Selectors config not found: {SELECTORS_CONFIG_FILE}")
         return {}
     except json.JSONDecodeError as e:
-        print(f"⚠ Error parsing selectors config: {e}")
+        warnings.warn(f"Error parsing selectors config: {e}")
         return {}
     except Exception as e:
-        print(f"⚠ Warning: Could not load selectors config: {str(e)}")
+        warnings.warn(f"Could not load selectors config: {str(e)}")
         return {}
 
 SELECTORS_CONFIG = load_selectors_config()
 
 # ==================== SCRAPING SETTINGS ====================
-# Timeout for WebDriver wait operations (in seconds)
-TIMEOUT = int(os.getenv("STO_TIMEOUT", SELECTORS_CONFIG.get("timing", {}).get("timeout", 10)))
-
 # Run in headless mode (no visible browser window)
 # Set to False to see browser automation for debugging
-HEADLESS = os.getenv("STO_HEADLESS", "true").lower() in ('true', '1', 'yes')
+HEADLESS = True
 
 # ==================== LOGGING ====================
 # Log file location (stored in logs/ directory)
 LOG_FILE = os.path.join(LOGS_DIR, "s_to_backup.log")
 LOG_LEVEL = "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+
+# ==================== TIMEOUTS & RETRIES ====================
+# HTTP request timeouts (in seconds)
+HTTP_REQUEST_TIMEOUT = 15.0  # Individual HTTP request timeout
+PAGE_LOAD_TIMEOUT = 20.0     # Total page load timeout
+ELEMENT_FIND_TIMEOUT = 5.0   # Finding DOM elements timeout
+DRIVER_QUIT_TIMEOUT = 5.0    # WebDriver quit timeout
+
+# Retry limits
+MAX_LOGIN_RETRIES = 3
+MAX_SEASON_DETECTION_RETRIES = 3
+MAX_EPISODE_SCRAPE_RETRIES = 2
+MAX_TOTAL_RETRIES = 5  # Global retry limit per series
 
 # ==================== ANTI-DETECTION SETTINGS ====================
 # These are configured in scraper2.py but can be overridden here if needed
@@ -78,4 +88,4 @@ LOG_LEVEL = "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
 # WebGL disabled: Yes (prevents ad tracking via WebGL)
 # Firefox strict tracking protection: Yes
 
-print(f"✓ Config loaded (DATA_DIR: {DATA_DIR}, TIMEOUT: {TIMEOUT}s)")
+print(f"✓ Config loaded (DATA_DIR: {DATA_DIR})")

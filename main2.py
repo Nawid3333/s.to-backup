@@ -6,11 +6,12 @@ Automatically scrapes your watched TV series from s.to and maintains a local ind
 
 import json
 import logging
+import logging.handlers
 import os
 import re
+import shutil
 import subprocess
 import sys
-import time
 from urllib.parse import urlparse
 
 # Add the project root directory to Python path
@@ -74,12 +75,16 @@ def _check_checkpoint(expected_mode):
             return {'ok': True, 'resume': False}
         return {'ok': False, 'resume': False}
 
-# Configure logging
+# Configure logging with rotation (prevents log files from growing indefinitely)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(LOG_FILE),
+        logging.handlers.RotatingFileHandler(
+            LOG_FILE,
+            maxBytes=10*1024*1024,  # 10 MB max per file
+            backupCount=5  # Keep 5 rotated files
+        ),
         logging.StreamHandler()
     ]
 )
@@ -187,10 +192,25 @@ def print_completed_series_alerts(index_manager=None):
         logger.error(f"Error printing completed series alerts: {e}")
 
 
+def check_disk_space(min_mb=100):
+    """Check if enough disk space is available. Returns True if OK, False if low."""
+    try:
+        stat = shutil.disk_usage(DATA_DIR)
+        available_mb = stat.free / (1024 * 1024)
+        if available_mb < min_mb:
+            print(f"\n✗ WARNING: Low disk space!")
+            print(f"  Available: {available_mb:.1f} MB (minimum needed: {min_mb} MB)")
+            print(f"  Please free up disk space before scraping.\n")
+            return False
+        return True
+    except Exception as e:
+        logger.warning(f"Could not check disk space: {e}")
+        return True  # Assume OK if we can't check
+
 def validate_credentials():
-    """Validate that credentials are configured"""
+    """Check that credentials are configured (does not test login)."""
     if not EMAIL or not PASSWORD:
-        print("✗ ERROR: Credentials not configured!")
+        print("\n✗ ERROR: Credentials not configured!")
         print("\nPlease follow these steps:")
         print("1. Copy '.env.example' to '.env'")
         print("2. Add your s.to email and password to the .env file")
@@ -234,17 +254,28 @@ def _run_scrape_and_save(run_kwargs, description, success_msg, no_data_msg):
             print(f"\n⚠ {no_data_msg}")
             logger.warning(no_data_msg)
 
+        # Scraping completed normally — safe to clear checkpoint now that user has confirmed/declined
+        scraper.clear_checkpoint()
+
         if scraper.failed_links:
             print(f"\n⚠ {len(scraper.failed_links)} series failed during scraping.")
             print("→ Use option 6 (Retry failed series) to rescrape these later.")
 
         return scraper
+    except (KeyboardInterrupt, SystemExit):
+        print(f"\n⚠ Scraping interrupted by Ctrl+C")
+        if 'scraper' in locals() and scraper.series_data:
+            index_manager = IndexManager(SERIES_INDEX_FILE)
+            if confirm_and_save_changes(scraper.series_data, description, index_manager):
+                print(f"\n✓ Partial data saved ({len(scraper.series_data)} series)")
+                logger.info(f"{description} interrupted — partial data saved")
+        if 'scraper' in locals() and scraper.failed_links:
+            print(f"\n⚠ {len(scraper.failed_links)} series failed.")
+            print("→ Use option 6 (Retry failed series) to rescrape these later.")
+        return scraper if 'scraper' in locals() else None
     except OSError as e:
         print(f"\n✗ Network error occurred: {str(e)}")
         logger.error(f"Network error in {description}: {e}")
-    except KeyboardInterrupt:
-        print("\n⚠ Scraping interrupted by user")
-        logger.info(f"{description} interrupted by user")
     except Exception as e:
         print(f"\n✗ Unexpected error: {str(e)}")
         logger.error(f"Unexpected error in {description}: {e}")
@@ -458,7 +489,7 @@ def generate_report():
             report = index_manager.get_full_report()
             
             # Save report
-            report_file = os.path.join(DATA_DIR, f'series_report_{time.strftime("%Y%m%d_%H%M%S")}.json')
+            report_file = os.path.join(DATA_DIR, 'series_report.json')
             with open(report_file, 'w', encoding='utf-8') as f:
                 json.dump(report, f, indent=2, ensure_ascii=False)
             
@@ -513,7 +544,7 @@ def generate_report():
                 return
             
             # Save report
-            report_file = os.path.join(DATA_DIR, f'series_report_{filter_name}_{time.strftime("%Y%m%d_%H%M%S")}.json')
+            report_file = os.path.join(DATA_DIR, 'series_report.json')
             with open(report_file, 'w', encoding='utf-8') as f:
                 json.dump(report, f, indent=2, ensure_ascii=False)
             
@@ -620,6 +651,16 @@ def scrape_subscribed_watchlist():
         if scraper.failed_links:
             print(f"\n⚠ {len(scraper.failed_links)} series failed during scraping.")
             print("→ Use option 6 (Retry failed series) to rescrape these later.")
+    except (KeyboardInterrupt, SystemExit):
+        print(f"\n⚠ Scraping interrupted by Ctrl+C")
+        if scraper and scraper.series_data:
+            index_manager = IndexManager(SERIES_INDEX_FILE)
+            if confirm_and_save_changes(scraper.series_data, "Account series", index_manager):
+                print(f"\n✓ Partial data saved ({len(scraper.series_data)} series)")
+                logger.info("Account series interrupted — partial data saved")
+        if scraper and scraper.failed_links:
+            print(f"\n⚠ {len(scraper.failed_links)} series failed.")
+            print("→ Use option 6 (Retry failed series) to rescrape these later.")
     except OSError as e:
         print(f"\n✗ Network error occurred: {str(e)}")
         logger.error(f"Network error in scrape_subscribed_watchlist: {e}")
@@ -682,72 +723,92 @@ def pause_scraping():
 
 def show_active_workers():
     """Display active worker processes"""
-    worker_pids_file = os.path.join(DATA_DIR, '.worker_pids.json')
-    
-    if not os.path.exists(worker_pids_file):
+    try:
+        pid_files = [
+            os.path.join(DATA_DIR, f) for f in os.listdir(DATA_DIR)
+            if f.startswith('.worker_pids_') and f.endswith('.json')
+        ]
+    except OSError:
+        pid_files = []
+
+    if not pid_files:
         print("\n✓ No active workers found\n")
         return
-    
-    try:
-        with open(worker_pids_file, 'r', encoding='utf-8') as f:
-            workers = json.load(f)
-        
-        if not isinstance(workers, dict) or not workers:
-            print("\n✓ No active workers\n")
-            return
-        
-        print(f"\n📊 ACTIVE WORKERS ({len(workers)}):")
-        print("ID | PID | Type")
-        print("---|-----|------")
-        
-        for worker_id, pid in sorted(workers.items(), key=lambda x: int(x[0].split('_')[0]) if x[0].split('_')[0].isdigit() else 999):
-            worker_type = "Main" if worker_id == "0" else ("Firefox" if "_firefox" in str(worker_id) else "Geckodriver")
-            print(f"{worker_id:>15} | {pid} | {worker_type}")
-        
-        print()
-        kill_choice = input("Kill all workers? (y/n): ").strip().lower()
-        if kill_choice == 'y':
-            print("\n🔴 Killing all workers...")
-            killed_count = 0
-            
-            # First, kill all tracked PIDs
+
+    # Collect all workers across all instances
+    all_workers = {}  # { (owner_pid, worker_id): (pid, filepath) }
+    live_files = []
+    for fpath in pid_files:
+        try:
+            with open(fpath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                continue
+            owner_pid = data.get('_owner_pid', '?')
+            workers = {k: v for k, v in data.items() if k != '_owner_pid'}
+            if not workers:
+                continue
+            live_files.append(fpath)
             for worker_id, pid in workers.items():
-                try:
-                    if sys.platform == 'win32':
-                        subprocess.run(['taskkill', '/F', '/PID', str(pid), '/T'], 
-                                     capture_output=True, check=False, timeout=5)
-                    else:
-                        subprocess.run(['kill', '-9', str(pid)], 
-                                     capture_output=True, check=False)
-                    killed_count += 1
-                except Exception as e:
-                    logger.error(f"Failed to kill worker {worker_id}: {e}")
-            
+                all_workers[(str(owner_pid), str(worker_id))] = (pid, fpath)
+        except Exception as e:
+            logger.error(f"Error reading {fpath}: {e}")
+
+    if not all_workers:
+        print("\n✓ No active workers found\n")
+        return
+
+    print(f"\n📊 ACTIVE WORKERS ({len(all_workers)} across {len(live_files)} instance(s)):")
+    print("Instance PID | Worker ID       | Worker PID | Type")
+    print("-------------|-----------------|------------|-----")
+    for (owner_pid, worker_id), (pid, _) in sorted(
+        all_workers.items(),
+        key=lambda x: (x[0][0], int(x[0][1].split('_')[0]) if x[0][1].split('_')[0].isdigit() else 999)
+    ):
+        worker_type = "Main" if worker_id == "0" else ("Firefox" if "_firefox" in worker_id else "Geckodriver")
+        print(f"{owner_pid:>12} | {worker_id:>15} | {pid:>10} | {worker_type}")
+
+    print()
+    kill_choice = input("Kill all workers? (y/n): ").strip().lower()
+    if kill_choice == 'y':
+        print("\n🔴 Killing all workers...")
+        killed_count = 0
+        for (owner_pid, worker_id), (pid, _) in all_workers.items():
             try:
-                os.remove(worker_pids_file)
-                print(f"✓ Killed {killed_count} tracked process(es) and their child processes")
-                logger.info(f"Killed {killed_count} tracked workers")
+                if sys.platform == 'win32':
+                    subprocess.run(['taskkill', '/F', '/PID', str(pid), '/T'],
+                                   capture_output=True, check=False, timeout=5)
+                else:
+                    subprocess.run(['kill', '-9', str(pid)],
+                                   capture_output=True, check=False)
+                killed_count += 1
             except Exception as e:
-                print(f"✓ Killed {killed_count} tracked process(es)")
-                print(f"⚠ Could not remove PID file: {e}\n")
-                logger.error(f"Failed to clean up PID file: {e}")
-        else:
-            print("✓ Workers left running\n")
-    
-    except Exception as e:
-        print(f"\n✗ Error reading workers: {str(e)}")
-        logger.error(f"Error reading workers: {e}")
+                logger.error(f"Failed to kill worker {worker_id} (PID {pid}): {e}")
+        removed_files = 0
+        for fpath in set(fp for _, (_, fp) in all_workers.items()):
+            try:
+                os.remove(fpath)
+                removed_files += 1
+            except Exception as e:
+                logger.error(f"Failed to clean up {fpath}: {e}")
+        print(f"✓ Killed {killed_count} tracked process(es) across {removed_files} instance(s)\n")
+        logger.info(f"Killed {killed_count} workers and cleaned up {removed_files} tracking files")
+    else:
+        print("✓ Workers left running\n")
 
 
 def main():
     """Main application loop"""
     print_header()
     
-    # Validate credentials
     if not validate_credentials():
         sys.exit(1)
     
-    print(f"✓ Credentials found for user: {EMAIL}\n")
+    # Check disk space at startup
+    if not check_disk_space():
+        response = input("Continue anyway? (y/n): ").strip().lower()
+        if response != 'y':
+            sys.exit(1)
     
     while True:
         show_menu()
@@ -756,6 +817,12 @@ def main():
         if not choice.isdigit() or not (1 <= int(choice) <= 9):
             print("✗ Invalid choice. Please enter a number between 1 and 9.")
             continue
+        
+        # Check disk space before each scraping operation
+        if choice in ['1', '2', '3', '5', '6']:
+            if not check_disk_space():
+                print("⚠ Aborting due to low disk space.")
+                continue
         
         if choice == '1':
             scrape_all_series()
