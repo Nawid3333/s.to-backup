@@ -1399,6 +1399,7 @@ class SToBackupScraper:
                         'url': f"{site_url}/serie/{slug}"
                     })
 
+            print(f"✓ Found {len(series_list)} unique series")
             return series_list
 
         except Exception as e:

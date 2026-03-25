@@ -52,8 +52,7 @@ htmlcov/
 geckodriver.exe
 geckodriver
 
-# Checkpoint files
-checkpoint_*.json
+/data/
 
 # Personal files
 /series_urls.txt
