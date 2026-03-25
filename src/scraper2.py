@@ -43,6 +43,15 @@ from config.config2 import (
 logger = logging.getLogger(__name__)
 
 
+# Adaptive backoff constants for server error handling
+MAX_HEAVY_BACKOFF = 5.0
+HEAVY_BACKOFF_FACTOR = 0.5
+MAX_MODERATE_BACKOFF = 3.0
+MODERATE_BACKOFF_FACTOR = 0.3
+LIGHT_BACKOFF_THRESHOLD = 1.0
+BACKOFF_DECAY_STEP = 0.1
+
+
 def _is_pid_alive(pid):
     """Check if a process with the given PID is still running."""
     try:
@@ -56,7 +65,7 @@ def _is_pid_alive(pid):
         else:
             os.kill(pid, 0)
             return True
-    except Exception:
+    except (OSError, ValueError):
         return False
 
 
@@ -66,17 +75,21 @@ def _kill_pids_in_file(pids_dict):
         if key == '_owner_pid':
             continue
         try:
+            pid = int(pid)
             if sys.platform == 'win32':
                 subprocess.run(
                     ['taskkill', '/F', '/PID', str(pid), '/T'],
                     capture_output=True, check=False, timeout=2
                 )
             else:
-                subprocess.run(
-                    ['kill', '-9', str(pid)],
-                    capture_output=True, check=False
-                )
-        except Exception:
+                # Try graceful termination first, then force kill
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    time.sleep(0.5)
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # Process already exited
+        except (OSError, ValueError, subprocess.SubprocessError):
             pass
 
 
@@ -106,10 +119,10 @@ def cleanup_stale_worker_pids():
             # Owner is dead — kill geckodriver orphans and clean up
             _kill_pids_in_file(pids)
             os.remove(fpath)
-        except Exception:
+        except (OSError, json.JSONDecodeError, ValueError):
             try:
                 os.remove(fpath)
-            except Exception:
+            except OSError:
                 pass
 
 
@@ -130,11 +143,11 @@ def cleanup_geckodriver_processes(timeout_sec=5):
             pids = json.load(f)
         if isinstance(pids, dict):
             _kill_pids_in_file(pids)
-    except Exception:
+    except (OSError, json.JSONDecodeError, ValueError):
         pass
     try:
         os.remove(_MY_PID_FILE)
-    except Exception:
+    except OSError:
         pass
 
 
@@ -159,7 +172,7 @@ if sys.platform == 'win32':
     signal.signal(signal.SIGBREAK, _signal_handler)
 
 # Performance settings - Allow overriding via environment variable
-MAX_WORKERS = 16
+MAX_WORKERS = 20
 
 
 # Pre-compiled regex for season label detection
@@ -269,6 +282,10 @@ class SToBackupScraper:
         self._server_error_times = []
         self._global_backoff = 0.0
         
+        # Periodic flush: series_data is written to disk to prevent unbounded memory growth
+        self._partial_data_file = os.path.join(DATA_DIR, '.series_data_partial.jsonl')
+        self._flushed_count = 0  # Total entries flushed to disk so far
+        
         # Validate config on init
         self._validate_selectors_config()
 
@@ -293,17 +310,17 @@ class SToBackupScraper:
             self._server_error_times = [t for t in self._server_error_times if now - t < 60]
             error_count = len(self._server_error_times)
             if error_count >= 15:
-                self._global_backoff = min(5.0, 0.5 * (error_count / 5))
+                self._global_backoff = min(MAX_HEAVY_BACKOFF, HEAVY_BACKOFF_FACTOR * (error_count / 5))
             elif error_count >= 8:
-                self._global_backoff = min(3.0, 0.3 * (error_count / 5))
+                self._global_backoff = min(MAX_MODERATE_BACKOFF, MODERATE_BACKOFF_FACTOR * (error_count / 5))
             elif error_count >= 4:
-                self._global_backoff = 1.0
+                self._global_backoff = LIGHT_BACKOFF_THRESHOLD
 
     def _decay_global_backoff(self):
         """Gradually reduce global backoff after successful requests."""
         with self._request_lock:
             if self._global_backoff > 0:
-                self._global_backoff = max(0.0, self._global_backoff - 0.1)
+                self._global_backoff = max(0.0, self._global_backoff - BACKOFF_DECAY_STEP)
 
     def _validate_selectors_config(self):
         """Validate that critical selectors are configured. Blocks startup if missing."""
@@ -630,6 +647,7 @@ class SToBackupScraper:
                     os.remove(self.checkpoint_file)
                 except OSError as e:
                     logger.debug(f"Could not remove checkpoint file: {e}")
+        self._cleanup_partial_file()
     
     def save_failed_series(self):
         """Save list of failed series for retry (thread-safe).
@@ -937,6 +955,10 @@ class SToBackupScraper:
             return local_xpi
         except Exception as e:
             print(f'⚠ Failed to download uBlock Origin: {e}')
+            try:
+                os.remove(local_xpi)
+            except OSError:
+                pass
             return None
     
     def setup_driver(self):
@@ -944,6 +966,7 @@ class SToBackupScraper:
         firefox_options = self._build_firefox_options()
         service = FirefoxService()
         self.driver = webdriver.Firefox(service=service, options=firefox_options)
+        self.driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
         
         # Track main driver PID (worker_id=0) so sequential mode is visible
         # in 'show active workers' and cleaned up on hard-kill
@@ -1177,31 +1200,28 @@ class SToBackupScraper:
             return False
 
     def close(self):
-        """Close the browser with timeout to prevent hangs"""
+        """Close the browser with timeout to prevent hangs (cross-platform)"""
         if self.driver:
             try:
-                # Set a timeout on driver quit to prevent hangs
-                import signal
-                def timeout_handler(signum, frame):
-                    logger.warning("Driver quit timeout, forcing exit")
-                    raise TimeoutException("Driver quit timed out")
-                
-                # Use alarm signal on Unix, simple timeout on Windows
-                original_handler = None
+                driver_ref = self.driver
+
+                def _force_kill():
+                    """Force-kill the browser process if quit() hangs."""
+                    logger.warning("Driver quit timeout, forcing kill")
+                    try:
+                        if driver_ref.service and driver_ref.service.process:
+                            driver_ref.service.process.kill()
+                    except Exception:
+                        pass
+
+                timer = threading.Timer(DRIVER_QUIT_TIMEOUT, _force_kill)
+                timer.start()
                 try:
-                    original_handler = signal.signal(signal.SIGALRM, timeout_handler)
-                    signal.alarm(int(DRIVER_QUIT_TIMEOUT))
-                    self.driver.quit()
-                    signal.alarm(0)  # Cancel alarm
-                except (AttributeError, ValueError):
-                    # Windows doesn't have SIGALRM, just try with short timeout
                     self.driver.quit()
                 finally:
-                    if original_handler:
-                        signal.signal(signal.SIGALRM, original_handler)
+                    timer.cancel()
             except Exception as e:
                 logger.warning(f"Error closing driver: {e}, forcing close")
-                pass
             print("✓ Browser closed")
     
     def _check_retry_limit(self, series_slug):
@@ -1214,16 +1234,68 @@ class SToBackupScraper:
             self._series_retry_count[series_slug] = count + 1
             return False
     
+    def _flush_series_data_to_disk(self):
+        """Append current series_data to a JSONL file on disk and clear the in-memory list.
+        
+        Called periodically during long scrapes to prevent unbounded memory growth.
+        NOT thread-safe — caller must hold self._lock if used from parallel context.
+        """
+        if not self.series_data:
+            return
+        try:
+            with open(self._partial_data_file, 'a', encoding='utf-8') as f:
+                for entry in self.series_data:
+                    f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+            self._flushed_count += len(self.series_data)
+            logger.debug(f"Flushed {len(self.series_data)} series to disk (total flushed: {self._flushed_count})")
+            self.series_data = []
+        except Exception as e:
+            logger.error(f"Failed to flush series data to disk: {e}")
+    
+    def _load_flushed_series_data(self):
+        """Read back all flushed entries from the JSONL file and merge with in-memory data.
+        
+        Returns the merged list and cleans up the partial file.
+        """
+        merged = list(self.series_data)
+        if os.path.exists(self._partial_data_file):
+            try:
+                with open(self._partial_data_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            merged.append(json.loads(line))
+                logger.debug(f"Loaded {len(merged) - len(self.series_data)} flushed entries from disk")
+            except Exception as e:
+                logger.error(f"Failed to load flushed series data: {e}")
+        self._cleanup_partial_file()
+        return merged
+    
+    def _cleanup_partial_file(self):
+        """Remove the partial JSONL flush file."""
+        try:
+            if os.path.exists(self._partial_data_file):
+                os.remove(self._partial_data_file)
+        except OSError:
+            pass
+
     def _cleanup_memory(self):
         """Clear in-memory data to prevent memory leaks."""
         with self._lock:
             # Keep completed_links (needed for checkpoint) but clear completed_links if very large
             if len(self.completed_links) > 10000:
                 logger.debug(f"Clearing completed_links (size: {len(self.completed_links)})")
-                self.completed_links = set([s.get('title') for s in self.series_data])
+                self.completed_links = set(
+                    s.get('url', '').rstrip('/').split('/')[-1]
+                    for s in self.series_data if s.get('url')
+                )
+            
+            # Flush series_data to disk if it has grown large
+            if len(self.series_data) > 200:
+                self._flush_series_data_to_disk()
             
             # Periodically log memory usage info
-            logger.debug(f"Memory: series_data={len(self.series_data)}, failed_links={len(self.failed_links)}, completed={len(self.completed_links)}")
+            logger.debug(f"Memory: series_data={len(self.series_data)}, flushed={self._flushed_count}, failed_links={len(self.failed_links)}, completed={len(self.completed_links)}")
     
     def _has_auth_cookies(self, driver):
         """Lightweight auth check: verify session cookies exist without page navigation.
@@ -1281,7 +1353,7 @@ class SToBackupScraper:
             self.inject_aggressive_adblock(drv)
             
             # Wait for submit button to appear
-            WebDriverWait(drv, self.get_timing_float('timeout', 15.0)).until(
+            WebDriverWait(drv, self.get_timing_float('element_timeout', 15.0)).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='submit'], button[type='submit']"))
             )
 
@@ -1289,7 +1361,7 @@ class SToBackupScraper:
             email_field = self.find_element_from_config(
                 drv, 
                 login_config.get('username_field', []),
-                timeout=self.get_timing_float('timeout', 15.0)
+                timeout=self.get_timing_float('element_timeout', 15.0)
             )
             if not email_field:
                 raise Exception("Email field not found")
@@ -1298,7 +1370,7 @@ class SToBackupScraper:
             password_field = self.find_element_from_config(
                 drv,
                 login_config.get('password_field', []),
-                timeout=self.get_timing_float('timeout', 15.0)
+                timeout=self.get_timing_float('element_timeout', 15.0)
             )
             if not password_field:
                 raise Exception("Password field not found")
@@ -1318,7 +1390,7 @@ class SToBackupScraper:
             submit_button = self.find_element_from_config(
                 drv,
                 login_config.get('submit_button', []),
-                timeout=self.get_timing_float('timeout', 15.0)
+                timeout=self.get_timing_float('element_timeout', 15.0)
             )
             
             # Execute form submission
@@ -2071,51 +2143,65 @@ class SToBackupScraper:
         """Create a new WebDriver for a worker thread and track its PID."""
         firefox_options = self._build_firefox_options()
         service = FirefoxService()
+        driver = None
+        try:
+            driver = webdriver.Firefox(service=service, options=firefox_options)
+            driver.set_page_load_timeout(PAGE_LOAD_TIMEOUT)
         
-        driver = webdriver.Firefox(service=service, options=firefox_options)
-        
-        # Install uBlock Origin
-        ublock_xpi = self._get_ublock_xpi()
-        if ublock_xpi:
-            try:
-                driver.install_addon(ublock_xpi, temporary=True)
-                time.sleep(self.get_timing_float('worker_addon_init_delay', 0.3))
-            except Exception:
-                pass
-        
-        # Track geckodriver PID and Firefox child process PIDs for cleanup
-        if worker_id is not None:
-            for attempt in range(5):
+            # Install uBlock Origin
+            ublock_xpi = self._get_ublock_xpi()
+            if ublock_xpi:
                 try:
-                    if hasattr(service, 'process') and service.process:
-                        geckodriver_pid = service.process.pid
-                        if geckodriver_pid:
-                            self.save_worker_pid(worker_id, geckodriver_pid)
-                            
-                            # Also try to find and save the Firefox child process PID
-                            try:
-                                # Use wmic to find Firefox child processes of geckodriver
-                                result = subprocess.run(
-                                    ['wmic', 'process', 'where', f'ParentProcessId={geckodriver_pid}', 
-                                     'get', 'ProcessId', '/value'],
-                                    capture_output=True, text=True,
-                                    encoding='utf-8', errors='replace',
-                                    timeout=self.get_timing_float('process_lookup_timeout', 2.0), check=False
-                                )
-                                for line in result.stdout.split('\n'):
-                                    if 'ProcessId' in line:
-                                        firefox_pid = line.split('=')[-1].strip()
-                                        if firefox_pid.isdigit():
-                                            # Save Firefox PID separately with a suffix to track it
-                                            self.save_worker_pid(f"{worker_id}_firefox", int(firefox_pid))
-                            except Exception:
-                                pass
-                            break
+                    driver.install_addon(ublock_xpi, temporary=True)
+                    time.sleep(self.get_timing_float('worker_addon_init_delay', 0.3))
                 except Exception:
                     pass
-                time.sleep(self.get_timing_float('worker_service_init_delay', 0.1))
         
-        return driver
+            # Track geckodriver PID and Firefox child process PIDs for cleanup
+            if worker_id is not None:
+                for attempt in range(5):
+                    try:
+                        if hasattr(service, 'process') and service.process:
+                            geckodriver_pid = service.process.pid
+                            if geckodriver_pid:
+                                self.save_worker_pid(worker_id, geckodriver_pid)
+                            
+                                # Also try to find and save the Firefox child process PID
+                                try:
+                                    # Use wmic to find Firefox child processes of geckodriver
+                                    result = subprocess.run(
+                                        ['wmic', 'process', 'where', f'ParentProcessId={geckodriver_pid}', 
+                                         'get', 'ProcessId', '/value'],
+                                        capture_output=True, text=True,
+                                        encoding='utf-8', errors='replace',
+                                        timeout=self.get_timing_float('process_lookup_timeout', 2.0), check=False
+                                    )
+                                    for line in result.stdout.split('\n'):
+                                        if 'ProcessId' in line:
+                                            firefox_pid = line.split('=')[-1].strip()
+                                            if firefox_pid.isdigit():
+                                                # Save Firefox PID separately with a suffix to track it
+                                                self.save_worker_pid(f"{worker_id}_firefox", int(firefox_pid))
+                                except Exception:
+                                    pass
+                                break
+                    except Exception:
+                        pass
+                    time.sleep(self.get_timing_float('worker_service_init_delay', 0.1))
+        
+            return driver
+        except Exception as e:
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+            elif hasattr(service, 'process') and service.process:
+                try:
+                    service.stop()
+                except Exception:
+                    pass
+            raise Exception(f"Failed to create worker driver: {str(e)}")
     
     def save_worker_pid(self, worker_id, pid):
         """Save worker geckodriver PID for cleanup (atomic write)."""
@@ -2223,6 +2309,100 @@ class SToBackupScraper:
         else:
             print(f"\n\u2713 Completed in {total_mins}m {total_secs}s")
 
+    def _scrape_all_seasons_first_pass(self, drv, series_slug, seasons, max_retries):
+        """
+        First pass: scrape every season in order, tracking subscription state.
+
+        Returns:
+            tuple: (season_results, title, sub_readings, sub_confirmed)
+        """
+        season_results = []
+        title = None
+        consecutive_failures = 0
+        _sub_readings = []
+        _sub_confirmed = False
+
+        for season in seasons:
+            season_url = f"https://s.to/serie/{series_slug}/staffel-{season}"
+            try:
+                if not self._is_driver_alive(drv):
+                    logger.error(f"{series_slug}: Driver died before season {season} — skipping remaining seasons")
+                    break
+
+                if not self._has_auth_cookies(drv):
+                    if not self.is_logged_in(drv):
+                        logger.warning(f"{series_slug}: Session expired before season {season} — re-authenticating")
+                        self._authenticate_driver(drv, label=f"season-{season}", max_attempts=2)
+
+                data = self.scrape_series_detail(season_url, drv, max_retries=max_retries,
+                                                 skip_subscription=_sub_confirmed)
+                if data is not None:
+                    season_results.append(data)
+                    if data.get('title'):
+                        title = data['title']
+                    if not _sub_confirmed:
+                        _sub_readings.append((data.get('subscribed'), data.get('watchlist')))
+                        if len(_sub_readings) >= 2 and _sub_readings[-1] == _sub_readings[-2]:
+                            _sub_confirmed = True
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+                    logger.warning(f"{series_slug}: Season {season} returned no data (fail #{consecutive_failures})")
+                    if consecutive_failures >= 2:
+                        backoff_step = self.get_timing_float('season_failure_backoff_step', 0.5)
+                        backoff_max = self.get_timing_float('season_failure_backoff_max', 2.0)
+                        backoff_jitter = self.get_timing_float('season_failure_backoff_jitter', 0.1)
+                        backoff = min(backoff_max, backoff_step * (consecutive_failures - 1))
+                        time.sleep(backoff + random.uniform(0, backoff_jitter))
+            except Exception as e:
+                consecutive_failures += 1
+                logger.warning(f"Error scraping {series_slug}/staffel-{season}: {e}")
+                if consecutive_failures >= 2:
+                    backoff_step = self.get_timing_float('season_failure_backoff_step', 0.5)
+                    backoff_max = self.get_timing_float('season_failure_backoff_max', 2.0)
+                    backoff_jitter = self.get_timing_float('season_failure_backoff_jitter', 0.1)
+                    backoff = min(backoff_max, backoff_step * (consecutive_failures - 1))
+                    time.sleep(backoff + random.uniform(0, backoff_jitter))
+
+        return season_results, title, _sub_readings, _sub_confirmed
+
+    def _retry_missing_seasons(self, drv, series_slug, missing, season_results, title):
+        """
+        Retry pass for seasons that failed during the first pass.
+
+        Mutates season_results in place. Returns updated title.
+        """
+        logger.warning(f"{series_slug}: Missing {len(missing)} season(s) after first pass: {sorted(missing)}")
+        print(f"  ⚠ {series_slug}: Retrying {len(missing)} missing season(s): {','.join(sorted(missing))}")
+
+        if not self._is_driver_alive(drv):
+            logger.error(f"{series_slug}: Driver dead before retry pass — cannot retry missing seasons")
+            return title
+
+        for season in sorted(missing):
+            season_url = f"https://s.to/serie/{series_slug}/staffel-{season}"
+            val = self.get_timing('max_retries_retry', default=None)
+            retry_max = int(val) if val is not None else 5
+            for attempt in range(retry_max):
+                try:
+                    data = self.scrape_series_detail(season_url, drv, max_retries=2)
+                    if data is not None:
+                        season_results.append(data)
+                        if data.get('title'):
+                            title = data['title']
+                        logger.info(f"{series_slug}: Recovered season {season} on retry attempt {attempt + 1}")
+                        print(f"    ✓ {series_slug}: Recovered season {season} (retry {attempt + 1}/{retry_max})")
+                        break
+                except Exception as e:
+                    logger.warning(f"{series_slug}: Retry {attempt + 1}/{retry_max} for season {season}: {e}")
+
+                if attempt < retry_max - 1:
+                    retry_delay = self.get_timing_float('missing_season_retry_delay', 0.2, max_val=10.0)
+                    retry_jitter = self.get_timing_float('missing_season_retry_jitter', 0.1, max_val=2.0)
+                    time.sleep(retry_delay + random.uniform(0, retry_jitter))
+
+        return title
+
     def _scrape_all_seasons_verified(self, series_slug, seasons, driver=None, max_retries=None):
         """
         Scrape all seasons of a series with verification and retry for missing ones.
@@ -2247,130 +2427,35 @@ class SToBackupScraper:
         if max_retries is None:
             val = self.get_timing('max_retries_season', default=None)
             max_retries = int(val) if val is not None else 3
-        
+
         expected = set(seasons)
-        season_results = []
-        title = None
-        consecutive_failures = 0
-        
-        # Subscription is series-level (same buttons on every season page).
-        # Check on the first 2 seasons for accuracy — once both agree, skip
-        # the check on remaining seasons. If they disagree, keep checking.
-        _sub_readings = []   # list of (subscribed, watchlist) tuples
-        _sub_confirmed = False
-        
-        # First pass: scrape all seasons
-        for season in seasons:
-            season_url = f"https://s.to/serie/{series_slug}/staffel-{season}"
-            try:
-                # Check if driver is still alive before each season
-                if not self._is_driver_alive(drv):
-                    logger.error(f"{series_slug}: Driver died before season {season} — skipping remaining seasons")
-                    break
 
-                # Per-season auth check: catch session expiry before navigating
-                if not self._has_auth_cookies(drv):
-                    if not self.is_logged_in(drv):
-                        logger.warning(f"{series_slug}: Session expired before season {season} — re-authenticating")
-                        self._authenticate_driver(drv, label=f"season-{season}", max_attempts=2)
+        # First pass
+        season_results, title, _sub_readings, _sub_confirmed = \
+            self._scrape_all_seasons_first_pass(drv, series_slug, seasons, max_retries)
 
-                data = self.scrape_series_detail(season_url, drv, max_retries=max_retries,
-                                                 skip_subscription=_sub_confirmed)
-                if data and data.get('total_episodes', 0) > 0:
-                    season_results.append(data)
-                    if data.get('title'):
-                        title = data['title']
-                    if not _sub_confirmed:
-                        _sub_readings.append((data.get('subscribed'), data.get('watchlist')))
-                        if len(_sub_readings) >= 2 and _sub_readings[-1] == _sub_readings[-2]:
-                            _sub_confirmed = True
-                    consecutive_failures = 0
-                elif data and data.get('total_episodes', 0) == 0:
-                    # Season exists but has 0 episodes — still valid (empty season)
-                    season_results.append(data)
-                    if data.get('title'):
-                        title = data['title']
-                    if not _sub_confirmed:
-                        _sub_readings.append((data.get('subscribed'), data.get('watchlist')))
-                        if len(_sub_readings) >= 2 and _sub_readings[-1] == _sub_readings[-2]:
-                            _sub_confirmed = True
-                    consecutive_failures = 0
-                else:
-                    # data is None → failed, will be retried below
-                    consecutive_failures += 1
-                    logger.warning(f"{series_slug}: Season {season} returned no data (fail #{consecutive_failures})")
-                    # Add minimal delay only if we have MULTIPLE consecutive failures (avoid hammering on single failures)
-                    if consecutive_failures >= 2:
-                        backoff_step = self.get_timing_float('season_failure_backoff_step', 0.5)
-                        backoff_max = self.get_timing_float('season_failure_backoff_max', 2.0)
-                        backoff_jitter = self.get_timing_float('season_failure_backoff_jitter', 0.1)
-                        backoff = min(backoff_max, backoff_step * (consecutive_failures - 1))
-                        time.sleep(backoff + random.uniform(0, backoff_jitter))
-            except Exception as e:
-                consecutive_failures += 1
-                logger.warning(f"Error scraping {series_slug}/staffel-{season}: {e}")
-                # Add minimal delay only if we have MULTIPLE consecutive failures
-                if consecutive_failures >= 2:
-                    backoff_step = self.get_timing_float('season_failure_backoff_step', 0.5)
-                    backoff_max = self.get_timing_float('season_failure_backoff_max', 2.0)
-                    backoff_jitter = self.get_timing_float('season_failure_backoff_jitter', 0.1)
-                    backoff = min(backoff_max, backoff_step * (consecutive_failures - 1))
-                    time.sleep(backoff + random.uniform(0, backoff_jitter))
-        
-        # Verification: which seasons did we actually get?
+        # Retry any missing seasons
         scraped = {r['season'] for r in season_results}
         missing = expected - scraped
-        
-        # Retry pass for any missing seasons
         if missing:
-            logger.warning(f"{series_slug}: Missing {len(missing)}/{len(expected)} seasons after first pass: {sorted(missing)}")
-            print(f"  ⚠ {series_slug}: Retrying {len(missing)} missing season(s): {','.join(sorted(missing))}")
-            
-            # Check driver health before starting retry pass
-            if not self._is_driver_alive(drv):
-                logger.error(f"{series_slug}: Driver dead before retry pass — cannot retry missing seasons")
-            else:
-                for season in sorted(missing):
-                    season_url = f"https://s.to/serie/{series_slug}/staffel-{season}"
-                    # Use extra retries for the verification retry pass
-                    val = self.get_timing('max_retries_retry', default=None)
-                    retry_max = int(val) if val is not None else 5
-                    for attempt in range(retry_max):
-                        try:
-                            data = self.scrape_series_detail(season_url, drv, max_retries=2)
-                            if data is not None:
-                                season_results.append(data)
-                                if data.get('title'):
-                                    title = data['title']
-                                logger.info(f"{series_slug}: Recovered season {season} on retry attempt {attempt + 1}")
-                                print(f"    ✓ {series_slug}: Recovered season {season} (retry {attempt + 1}/{retry_max})")
-                                break
-                        except Exception as e:
-                            logger.warning(f"{series_slug}: Retry {attempt + 1}/{retry_max} for season {season}: {e}")
-                        
-                        # Minimal delay between retries.
-                        if attempt < retry_max - 1:
-                            retry_delay = self.get_timing_float('missing_season_retry_delay', 0.2, max_val=10.0)
-                            retry_jitter = self.get_timing_float('missing_season_retry_jitter', 0.1, max_val=2.0)
-                            time.sleep(retry_delay + random.uniform(0, retry_jitter))
-        
+            title = self._retry_missing_seasons(drv, series_slug, missing, season_results, title)
+
         # Final verification
         scraped_final = {r['season'] for r in season_results}
         still_missing = expected - scraped_final
-        
+
         if still_missing:
             logger.error(f"{series_slug}: Still missing {len(still_missing)} season(s) after retries: {sorted(still_missing)}")
-        
+
         # Sort results by season number for consistent output
         season_results.sort(key=lambda r: int(r['season']) if r['season'].isdigit() else -1)
-        
+
         # Determine confirmed subscription/watchlist values.
         # These are series-level (not per-season), so extract once and
         # strip from individual season dicts.
         if _sub_confirmed and _sub_readings:
             confirmed_sub, confirmed_wl = _sub_readings[-1]
         else:
-            # Fall back to first non-None reading from any season
             confirmed_sub = next(
                 (r['subscribed'] for r in season_results if r.get('subscribed') is not None),
                 False
@@ -2379,12 +2464,12 @@ class SToBackupScraper:
                 (r['watchlist'] for r in season_results if r.get('watchlist') is not None),
                 False
             )
-        
+
         # Remove per-season subscription fields — they belong on the series
         for r in season_results:
             r.pop('subscribed', None)
             r.pop('watchlist', None)
-        
+
         return {
             'season_results': season_results,
             'missing_seasons': sorted(still_missing) if still_missing else [],
@@ -2435,7 +2520,7 @@ class SToBackupScraper:
             try:
                 driver = self._create_worker_driver(worker_id)
             except Exception as e:
-                logger.error(f"Worker #{worker_id}: failed to create driver: {e}")
+                logger.error(f"Worker #{worker_id}: failed to create driver: {e}", exc_info=True)
                 print(f"  ✗ Worker #{worker_id}: Failed to create browser: {str(e)[:80]}")
                 return
             self.inject_aggressive_adblock(driver)
@@ -2495,7 +2580,7 @@ class SToBackupScraper:
                             logger.info(f"W{worker_id}: Driver restarted and re-authenticated")
                             print(f"  ✓ W{worker_id}: Browser restarted successfully")
                         except Exception as e:
-                            logger.error(f"W{worker_id}: Failed to restart driver: {e}")
+                            logger.error(f"W{worker_id}: Failed to restart driver: {e}", exc_info=True)
                             print(f"  ✗ W{worker_id}: Failed to restart browser — giving up")
                             work_queue.put(item)  # Put item back for other workers
                             break
@@ -2524,10 +2609,10 @@ class SToBackupScraper:
                                 logger.info(f"W{worker_id}: Driver restarted and re-authenticated")
                                 print(f"  ✓ W{worker_id}: Browser restarted — {series_slug} re-queued")
                             except Exception as restart_err:
-                                logger.error(f"W{worker_id}: Failed to restart driver: {restart_err}")
+                                logger.error(f"W{worker_id}: Failed to restart driver: {restart_err}", exc_info=True)
                                 break
                             continue
-                        logger.error(f"W{worker_id}: Season detection failed for {series_slug}: {e}")
+                        logger.error(f"W{worker_id}: Season detection failed for {series_slug}: {e}", exc_info=True)
                         print(f"  ✗ W{worker_id}: Season detection failed for {series_slug}: {str(e)[:80]}")
                         with self._lock:
                             completed += 1
@@ -2564,7 +2649,7 @@ class SToBackupScraper:
                             logger.info(f"W{worker_id}: Driver restarted and re-authenticated")
                             print(f"  ✓ W{worker_id}: Browser restarted — {series_slug} re-queued")
                         except Exception as restart_err:
-                            logger.error(f"W{worker_id}: Failed to restart driver: {restart_err}")
+                            logger.error(f"W{worker_id}: Failed to restart driver: {restart_err}", exc_info=True)
                             break
                         continue
                     
@@ -2599,9 +2684,11 @@ class SToBackupScraper:
                             print(self._format_progress_line(completed, total_series, start_time, series_title, watched=series_watched, episode_total=series_total_eps, worker_id=worker_id, worker_count=worker_count, season_labels=seasons, subscribed=is_sub, watchlist=is_wl))
                         error_streak = 0
                         tasks_since_check += 1
-                        
-                        if completed % 10 == 0:
-                            self.save_checkpoint()
+                        _should_save = (completed % 10 == 0)
+                    
+                    # Checkpoint save OUTSIDE self._lock to avoid deadlock
+                    if _should_save:
+                        self.save_checkpoint()
                     
                 except Exception as e:
                     # Check if the error was caused by a dead driver
@@ -2623,10 +2710,10 @@ class SToBackupScraper:
                             logger.info(f"W{worker_id}: Driver restarted and re-authenticated")
                             print(f"  ✓ W{worker_id}: Browser restarted — {series_slug} re-queued")
                         except Exception as restart_err:
-                            logger.error(f"W{worker_id}: Failed to restart driver: {restart_err}")
+                            logger.error(f"W{worker_id}: Failed to restart driver: {restart_err}", exc_info=True)
                             break
                         continue
-                    logger.error(f"W{worker_id}: Unhandled error for {series_slug}: {e}")
+                    logger.error(f"W{worker_id}: Unhandled error for {series_slug}: {e}", exc_info=True)
                     with self._lock:
                         completed += 1
                         failed += 1
@@ -2661,7 +2748,7 @@ class SToBackupScraper:
                                 else:
                                     error_streak += 1
                         except Exception as e:
-                            logger.error(f"W{worker_id}: Health check failed: {e}")
+                            logger.error(f"W{worker_id}: Health check failed: {e}", exc_info=True)
                             error_streak += 1
                     else:
                         # Routine check: lightweight cookie check (no page loads)
@@ -2676,7 +2763,7 @@ class SToBackupScraper:
                                     else:
                                         error_streak += 1
                             except Exception as e:
-                                logger.error(f"W{worker_id}: Health check failed: {e}")
+                                logger.error(f"W{worker_id}: Health check failed: {e}", exc_info=True)
                                 error_streak += 1
                 
                 # Restart driver after too many consecutive errors

@@ -378,11 +378,27 @@ def batch_add_from_file(file_path):
     """Add multiple series from a text file containing URLs"""
     try:
         urls = []
+        skipped = []
         with open(file_path, 'r', encoding='utf-8') as f:
-            for line in f:
+            for line_num, line in enumerate(f, 1):
                 url = line.strip()
-                if url and not url.startswith('#'):  # Skip empty lines and comments
-                    urls.append(url)
+                if not url or url.startswith('#'):  # Skip empty lines and comments
+                    continue
+                # Validate URL format
+                parsed = urlparse(url)
+                if parsed.scheme and parsed.scheme not in ('http', 'https'):
+                    skipped.append((line_num, url))
+                    continue
+                if not _SERIE_URL_RE.search(parsed.path):
+                    skipped.append((line_num, url))
+                    continue
+                urls.append(url)
+        if skipped:
+            print(f"⚠ Skipped {len(skipped)} invalid URL(s):")
+            for line_num, bad_url in skipped[:5]:
+                print(f"  Line {line_num}: {bad_url[:80]}")
+            if len(skipped) > 5:
+                print(f"  ... and {len(skipped) - 5} more")
     except Exception as e:
         print(f"✗ Failed to read file: {str(e)}")
         logger.error(f"Failed to read file {file_path}: {e}")
@@ -392,7 +408,7 @@ def batch_add_from_file(file_path):
         print("✗ No valid URLs found in file")
         return
     
-    print(f"✓ Found {len(urls)} URL(s) in file\n")
+    print(f"✓ Found {len(urls)} valid URL(s) in file\n")
     print("URLs to process:")
     for url in urls[:5]:  # Show first 5
         print(f"  • {url}")

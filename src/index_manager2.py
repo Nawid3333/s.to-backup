@@ -4,7 +4,6 @@ Manages the persistent series index and handles data merging, change detection, 
 Ported from Save bs.to with s.to-specific extensions (subscription/watchlist tracking).
 """
 
-import hashlib
 import json
 import logging
 import os
@@ -21,6 +20,21 @@ logger = logging.getLogger(__name__)
 # Pre-compiled regex for season number extraction
 _SEASON_NUMBER_RE = re.compile(r'(staffel|season|s)\s*(\d+)', re.IGNORECASE)
 
+# Pre-compiled regex for valid s.to series URL/path
+_VALID_SERIES_URL_RE = re.compile(r'^https://s\.to/serie/[^/]+/?$')
+_VALID_SERIES_PATH_RE = re.compile(r'^/serie/[^/]+/?$')
+
+
+def _is_valid_series_url(url):
+    """Check if a URL is a valid s.to series URL or relative path.
+    
+    Rejects dangerous schemes (javascript:, data:, file://) and
+    only allows https://s.to/serie/... or /serie/... paths.
+    """
+    if not url or not isinstance(url, str):
+        return False
+    return bool(_VALID_SERIES_URL_RE.match(url) or _VALID_SERIES_PATH_RE.match(url))
+
 
 class FileLock:
     """Simple file-based lock for preventing concurrent access to critical files.
@@ -36,7 +50,11 @@ class FileLock:
         self.lock_acquired = False
     
     def acquire(self):
-        """Acquire lock, waiting up to timeout seconds."""
+        """Acquire lock, waiting up to timeout seconds.
+        
+        If the timeout expires and a stale lock from a dead process is detected,
+        the stale lock is removed and acquisition is retried once.
+        """
         start = time.time()
         while time.time() - start < self.timeout:
             try:
@@ -49,8 +67,41 @@ class FileLock:
             except (OSError, FileExistsError):
                 time.sleep(self.poll_interval)
         
+        # Timeout expired — check if the lock is stale (owner process died)
+        if self._is_lock_stale():
+            logger.warning(f"Removing stale lock on {self.filepath} (owner process dead)")
+            try:
+                os.remove(self.lock_file)
+            except OSError:
+                pass
+            # Retry once after removing stale lock
+            try:
+                fd = os.open(self.lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, f"{os.getpid()}\n".encode())
+                os.close(fd)
+                self.lock_acquired = True
+                return True
+            except (OSError, FileExistsError):
+                pass
+        
         logger.warning(f"Could not acquire lock on {self.filepath} after {self.timeout}s")
         return False
+    
+    def _is_lock_stale(self):
+        """Check if the lock file was left by a process that is no longer running."""
+        try:
+            with open(self.lock_file, 'r') as f:
+                pid_str = f.read().strip()
+            pid = int(pid_str)
+            # Check if the process is still alive
+            try:
+                os.kill(pid, 0)
+                return False  # Process is still alive — lock is valid
+            except OSError:
+                return True  # Process is dead — lock is stale
+        except (OSError, ValueError):
+            # Can't read or parse pid — treat as stale to unblock
+            return True
     
     def release(self):
         """Release lock by removing lock file."""
@@ -67,19 +118,6 @@ class FileLock:
     
     def __exit__(self, *args):
         self.release()
-
-
-def _compute_file_checksum(filepath):
-    """Compute SHA256 checksum of a file for corruption detection."""
-    try:
-        sha256_hash = hashlib.sha256()
-        with open(filepath, 'rb') as f:
-            for byte_block in iter(lambda: f.read(4096), b""):
-                sha256_hash.update(byte_block)
-        return sha256_hash.hexdigest()
-    except Exception as e:
-        logger.warning(f"Could not compute checksum for {filepath}: {e}")
-        return None
 
 
 def _create_file_backup(filepath):
@@ -141,6 +179,32 @@ def _atomic_write_json(filepath, data):
         except OSError:
             pass
         raise
+
+
+def _validate_series_entry(series, title=''):
+    """Validate that a series entry has the required structure. Returns True if valid."""
+    if not isinstance(series, dict):
+        logger.warning(f"Skipping invalid series entry (not dict): {title}")
+        return False
+    url = series.get('url', '')
+    if not url:
+        logger.warning(f"Skipping series '{title}' - missing 'url' field")
+        return False
+    if not _is_valid_series_url(url):
+        logger.warning(f"Skipping series '{title}' - invalid URL scheme/format: {url[:80]}")
+        return False
+    seasons = series.get('seasons')
+    if seasons is not None and not isinstance(seasons, list):
+        logger.warning(f"Skipping series '{title}' - 'seasons' must be list, got {type(seasons)}")
+        return False
+    for season in (seasons or []):
+        if not isinstance(season, dict):
+            continue
+        episodes = season.get('episodes')
+        if episodes is not None and not isinstance(episodes, list):
+            logger.warning(f"Series '{title}' season '{season.get('season', '?')}' has invalid episodes type")
+            season['episodes'] = []
+    return True
 
 
 def _find_series(new_data, title):
@@ -427,20 +491,8 @@ class IndexManager:
                     # Validate each loaded series has required fields
                     validated_index = {}
                     for title, series in self.series_index.items():
-                        if not isinstance(series, dict):
-                            logger.warning(f"Skipping invalid series entry (not dict): {title}")
-                            continue
-                        # Check for critical fields
-                        if not series.get('url'):
-                            logger.warning(f"Skipping series '{title}' - missing 'url' field")
-                            continue
-                        if not isinstance(series.get('seasons'), list):
-                            logger.warning(f"Skipping series '{title}' - 'seasons' must be list, got {type(series.get('seasons'))}")  
-                            continue
-                        validated_index[title] = series
-                    
-                    self.series_index = validated_index
-                    
+                        if _validate_series_entry(series, title):
+                            validated_index[title] = series
                     # Check that loaded data is not empty
                     if not self.series_index:
                         logger.warning("Loaded index is empty or contains no valid series")
@@ -667,37 +719,22 @@ class IndexManager:
         return report
 
 
-def confirm_and_save_changes(new_data, description, index_manager):
+def _prompt_change_confirmations(changes, new_dict):
     """
-    Show changes, ask for separate watched/unwatched confirmation, merge, and save.
-    Preserves old watch status by default unless user explicitly confirms changes.
-    
-    Args:
-        new_data: List or dict of scraped series
-        description: What was scraped (for display)
-        index_manager: IndexManager instance
-    
+    Prompt the user to confirm each category of detected changes.
+
     Returns:
-        True if saved, False if cancelled
+        dict mapping change category to bool (allowed or not).
     """
-    old_data = dict(index_manager.series_index)
-    
-    # Ensure new_data is a dict
-    if isinstance(new_data, list):
-        new_dict = {s.get('title'): s for s in new_data if s.get('title')}
-    else:
-        new_dict = dict(new_data)
-    
-    changes = detect_changes(old_data, new_dict)
-    logger.info(f"Detected changes: { {k: len(v) for k, v in changes.items()} }")
-    
-    allow_watched = False
-    allow_unwatched = False
-    allow_subscription = False
-    allow_watchlist = False
-    allow_title_ger = False
-    allow_title_eng = False
-    
+    allowed = {
+        'watched': False,
+        'unwatched': False,
+        'subscription': False,
+        'watchlist': False,
+        'title_ger': False,
+        'title_eng': False,
+    }
+
     # Confirm watched (unwatched -> watched)
     if changes['newly_watched']:
         print(f"\n[OK] {len(changes['newly_watched'])} episode(s) would change from UNWATCHED to WATCHED")
@@ -719,12 +756,12 @@ def confirm_and_save_changes(new_data, description, index_manager):
         print("-"*70)
         resp = input("\nAllow these episodes to be marked as WATCHED? (y/n): ").strip().lower()
         if resp == 'y':
-            allow_watched = True
+            allowed['watched'] = True
             logger.info("User allowed watched changes.")
         else:
             print("  -> Watched changes will be ignored (episodes stay unwatched)")
             logger.info("User denied watched changes.")
-    
+
     # Confirm unwatched (watched -> unwatched)
     if changes['newly_unwatched']:
         print(f"\n[WARN] {len(changes['newly_unwatched'])} episode(s) would change from WATCHED to UNWATCHED")
@@ -746,12 +783,12 @@ def confirm_and_save_changes(new_data, description, index_manager):
         print("-"*70)
         resp = input("\nAllow these episodes to be marked as UNWATCHED? (y/n): ").strip().lower()
         if resp == 'y':
-            allow_unwatched = True
+            allowed['unwatched'] = True
             logger.info("User allowed unwatched changes.")
         else:
             print("  -> Unwatched changes will be ignored (episodes stay watched)")
             logger.info("User denied unwatched changes.")
-    
+
     # Confirm subscription changes
     if changes['subscription_changed']:
         print(f"\n[~] {len(changes['subscription_changed'])} series subscription(s) changed")
@@ -763,12 +800,12 @@ def confirm_and_save_changes(new_data, description, index_manager):
         print("-"*70)
         resp = input("\nAllow subscription changes? (y/n): ").strip().lower()
         if resp == 'y':
-            allow_subscription = True
+            allowed['subscription'] = True
             logger.info("User allowed subscription changes.")
         else:
             print("  -> Subscription changes will be ignored")
             logger.info("User denied subscription changes.")
-    
+
     # Confirm watchlist changes
     if changes['watchlist_changed']:
         print(f"\n[~] {len(changes['watchlist_changed'])} series watchlist status changed")
@@ -780,12 +817,12 @@ def confirm_and_save_changes(new_data, description, index_manager):
         print("-"*70)
         resp = input("\nAllow watchlist changes? (y/n): ").strip().lower()
         if resp == 'y':
-            allow_watchlist = True
+            allowed['watchlist'] = True
             logger.info("User allowed watchlist changes.")
         else:
             print("  -> Watchlist changes will be ignored")
             logger.info("User denied watchlist changes.")
-    
+
     # Confirm title_ger changes
     if changes['title_ger_changed']:
         print(f"\n[~] {len(changes['title_ger_changed'])} German title(s) changed")
@@ -798,12 +835,12 @@ def confirm_and_save_changes(new_data, description, index_manager):
         print("-"*70)
         resp = input("\nAllow German title changes? (y/n): ").strip().lower()
         if resp == 'y':
-            allow_title_ger = True
+            allowed['title_ger'] = True
             logger.info("User allowed German title changes.")
         else:
             print("  -> German title changes will be ignored")
             logger.info("User denied German title changes.")
-    
+
     # Confirm title_eng changes
     if changes['title_eng_changed']:
         print(f"\n[~] {len(changes['title_eng_changed'])} English title(s) changed")
@@ -816,27 +853,22 @@ def confirm_and_save_changes(new_data, description, index_manager):
         print("-"*70)
         resp = input("\nAllow English title changes? (y/n): ").strip().lower()
         if resp == 'y':
-            allow_title_eng = True
+            allowed['title_eng'] = True
             logger.info("User allowed English title changes.")
         else:
             print("  -> English title changes will be ignored")
             logger.info("User denied English title changes.")
-    
-    # Clear disallowed changes
-    if not allow_watched:
-        changes['newly_watched'] = []
-    if not allow_unwatched:
-        changes['newly_unwatched'] = []
-    if not allow_subscription:
-        changes['subscription_changed'] = []
-    if not allow_watchlist:
-        changes['watchlist_changed'] = []
-    if not allow_title_ger:
-        changes['title_ger_changed'] = []
-    if not allow_title_eng:
-        changes['title_eng_changed'] = []
-    
-    # Build merged data preserving old entries
+
+    return allowed
+
+
+def _build_merged_data(old_data, new_dict, allowed):
+    """
+    Merge new scraped data into old data, respecting user-allowed change categories.
+
+    Returns:
+        dict: merged series index.
+    """
     merged = dict(old_data)
     for title, new_entry in new_dict.items():
         if title in merged:
@@ -852,9 +884,9 @@ def confirm_and_save_changes(new_data, description, index_manager):
                         if ep_num in old_eps:
                             old_watched = old_eps[ep_num].get('watched', False)
                             new_watched = new_ep.get('watched', False)
-                            if allow_watched and (not old_watched and new_watched):
+                            if allowed['watched'] and (not old_watched and new_watched):
                                 new_ep['watched'] = True
-                            elif allow_unwatched and (old_watched and not new_watched):
+                            elif allowed['unwatched'] and (old_watched and not new_watched):
                                 new_ep['watched'] = False
                             else:
                                 new_ep['watched'] = old_watched
@@ -874,15 +906,24 @@ def confirm_and_save_changes(new_data, description, index_manager):
                 for s in old_entry['seasons']
             )
             old_entry['unwatched_episodes'] = old_entry['total_episodes'] - old_entry['watched_episodes']
-            old_entry['url'] = new_entry.get('url', old_entry.get('url'))
-            old_entry['link'] = new_entry.get('link', old_entry.get('link'))
-            if allow_subscription and 'subscribed' in new_entry:
+            # Validate URLs before merging to reject malicious values
+            new_url = new_entry.get('url', '')
+            new_link = new_entry.get('link', '')
+            if new_url and _is_valid_series_url(new_url):
+                old_entry['url'] = new_url
+            elif new_url:
+                logger.warning(f"Rejected invalid URL during merge for '{title}': {new_url[:80]}")
+            if new_link and _is_valid_series_url(new_link):
+                old_entry['link'] = new_link
+            elif new_link:
+                logger.warning(f"Rejected invalid link during merge for '{title}': {new_link[:80]}")
+            if allowed['subscription'] and 'subscribed' in new_entry:
                 old_entry['subscribed'] = new_entry['subscribed']
-            if allow_watchlist and 'watchlist' in new_entry:
+            if allowed['watchlist'] and 'watchlist' in new_entry:
                 old_entry['watchlist'] = new_entry['watchlist']
-            if allow_title_ger and 'title_ger' in new_entry:
+            if allowed['title_ger'] and 'title_ger' in new_entry:
                 old_entry['title_ger'] = new_entry['title_ger']
-            if allow_title_eng and 'title_eng' in new_entry:
+            if allowed['title_eng'] and 'title_eng' in new_entry:
                 old_entry['title_eng'] = new_entry['title_eng']
             # Merge alt_titles: combine old + new, deduplicate, preserve order
             old_alts = old_entry.get('alt_titles', [])
@@ -915,15 +956,62 @@ def confirm_and_save_changes(new_data, description, index_manager):
             seasons = new_entry.pop('seasons', [])
             new_entry['seasons'] = seasons
             merged[title] = new_entry
+
+    return merged
+
+
+def confirm_and_save_changes(new_data, description, index_manager):
+    """
+    Show changes, ask for separate watched/unwatched confirmation, merge, and save.
+    Preserves old watch status by default unless user explicitly confirms changes.
     
-    # Check if there are remaining changes to save
+    Args:
+        new_data: List or dict of scraped series
+        description: What was scraped (for display)
+        index_manager: IndexManager instance
+    
+    Returns:
+        True if saved, False if cancelled
+    """
+    old_data = dict(index_manager.series_index)
+    
+    # Ensure new_data is a dict
+    if isinstance(new_data, list):
+        new_dict = {s.get('title'): s for s in new_data if s.get('title')}
+    else:
+        new_dict = dict(new_data)
+    
+    changes = detect_changes(old_data, new_dict)
+    logger.info(f"Detected changes: { {k: len(v) for k, v in changes.items()} }")
+    
+    # Step 1: Prompt user for each change category
+    allowed = _prompt_change_confirmations(changes, new_dict)
+
+    # Clear disallowed changes
+    if not allowed['watched']:
+        changes['newly_watched'] = []
+    if not allowed['unwatched']:
+        changes['newly_unwatched'] = []
+    if not allowed['subscription']:
+        changes['subscription_changed'] = []
+    if not allowed['watchlist']:
+        changes['watchlist_changed'] = []
+    if not allowed['title_ger']:
+        changes['title_ger_changed'] = []
+    if not allowed['title_eng']:
+        changes['title_eng_changed'] = []
+    
+    # Step 2: Build merged data
+    merged = _build_merged_data(old_data, new_dict, allowed)
+    
+    # Step 3: Check if there are remaining changes to save
     main_changes = sum(len(v) for k, v in changes.items()
                        if k not in ('newly_unwatched', 'subscription_changed', 'watchlist_changed'))
-    if allow_unwatched:
+    if allowed['unwatched']:
         main_changes += len(changes['newly_unwatched'])
-    if allow_subscription:
+    if allowed['subscription']:
         main_changes += len(changes['subscription_changed'])
-    if allow_watchlist:
+    if allowed['watchlist']:
         main_changes += len(changes['watchlist_changed'])
     if main_changes == 0:
         print(f"\n✓ {description} already up to date.")

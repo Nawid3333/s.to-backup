@@ -51,9 +51,9 @@
     }
   },
   "timing": {
-    "page_load_delay": 0.5,
     "initial_delay": 0.5,
-    "timeout": 15,
+    "element_timeout": 15,
+    "season_nav_wait": 10.0,
     "element_find_timeout": 2,
     "page_ready_timeout": 10,
     "page_ready_body_timeout": 10,
