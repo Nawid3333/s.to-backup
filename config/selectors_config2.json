@@ -77,6 +77,8 @@
     "success_delay": 0.8,
     "error_backoff_base": 2.0,
     "error_backoff_max": 15.0,
+    "error_backoff_502_base": 2.0,
+    "error_backoff_502_max": 10.0,
     "min_request_interval": 0.25,
     "health_check_every": 15,
     "error_restart_threshold": 8,

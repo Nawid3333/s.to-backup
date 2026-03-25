@@ -1808,16 +1808,20 @@ class SToBackupScraper:
             except Exception as e:
                 error_msg = str(e)
                 if attempt < max_retries - 1:
-                    # Use longer backoff for rate limiting (429) and server overload (502/503)
+                    # Use shorter backoff for transient server errors (502/503/429) — they
+                    # clear quickly; the old 10 s base caused huge time loss at scale.
                     if '429' in error_msg or '502' in error_msg or '503' in error_msg:
-                        backoff = min(30.0, 10.0 * (2 ** attempt))
-                        logger.warning(f"Server overload on {series_url}, backing off {backoff:.0f}s")
+                        self._record_server_error()
+                        base = self.get_timing_float('error_backoff_502_base', 2.0)
+                        cap  = self.get_timing_float('error_backoff_502_max', 10.0)
+                        backoff = min(cap, base * (2 ** attempt))
+                        logger.warning(f"Server overload on {series_url}, backing off {backoff:.1f}s")
                     else:
                         backoff = min(self.get_timing_float('error_backoff_max', 15.0),
                                       self.get_timing_float('error_backoff_base', 2.0) * (2 ** attempt))
                     logger.warning(f"Retry {attempt + 2}/{max_retries} for {series_url}: {e}")
                     print(f"  ⚠ Retrying {series_url} (attempt {attempt + 2}/{max_retries}): {str(e)[:50]}")
-                    time.sleep(backoff + random.uniform(0.5, 2.0))
+                    time.sleep(backoff + random.uniform(0.5, 1.5))
                 else:
                     logger.error(f"Failed to scrape {series_url} after {max_retries} attempts: {e}")
                     print(f"  ✗ Failed to scrape {series_url} after {max_retries} attempts: {str(e)[:80]}")
@@ -2011,8 +2015,10 @@ class SToBackupScraper:
                         last_error = f"{server_error} on season detection for {series_slug}"
                         logger.warning(f"Attempt {attempt + 1}/{max_retries}: {last_error}")
                         if attempt < max_retries - 1:
-                            backoff = min(30.0, 10.0 * (2 ** attempt))
-                            time.sleep(backoff + random.uniform(0.5, 2.0))
+                            base = self.get_timing_float('error_backoff_502_base', 2.0)
+                            cap  = self.get_timing_float('error_backoff_502_max', 10.0)
+                            backoff = min(cap, base * (2 ** attempt))
+                            time.sleep(backoff + random.uniform(0.5, 1.5))
                             continue
                         raise SeasonDetectionError(last_error)
                     
