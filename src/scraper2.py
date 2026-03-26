@@ -272,6 +272,9 @@ class SToBackupScraper:
         # Retry tracking per series (prevents infinite retries)
         self._series_retry_count = {}  # key: series_slug, value: retry count
 
+        # Full catalogue from get_all_series() — stored for vanished-series detection
+        self.all_discovered_series = None
+
         # Global rate limiter — prevents all workers from hammering the server simultaneously
         self._request_lock = threading.Lock()
         self._last_request_time = 0.0
@@ -420,12 +423,13 @@ class SToBackupScraper:
         return series_url, series_slug, display_title
 
     def _aggregate_season_results(self, series_slug, season_results, missing_seasons, series_data,
-                                    is_subscribed=False, is_watchlist=False):
+                                    is_subscribed=None, is_watchlist=None):
         """Build series_data entry from season results and mark completed if successful.
 
         Caller must hold self._lock when used in parallel mode.
         is_subscribed / is_watchlist are series-level values already extracted
-        by _scrape_all_seasons_verified.
+        by _scrape_all_seasons_verified.  None means the value could not be
+        determined (page did not load correctly).
 
         Returns:
             tuple: (series_watched, series_total_eps, series_had_error, is_subscribed, is_watchlist)
@@ -1518,6 +1522,8 @@ class SToBackupScraper:
             list[dict]: Series found on this account page
         """
         series_list = []
+        seen_slugs = set()
+        expected_count = None
         page_num = 1
         while True:
             url = f"{site_url}{page_path}" if page_num == 1 else f"{site_url}{page_path}?page={page_num}"
@@ -1528,9 +1534,15 @@ class SToBackupScraper:
                 soup = BeautifulSoup(driver.page_source, 'html.parser')
 
                 if page_num == 1:
-                    count_div = soup.find('div', class_='text-muted')
-                    if count_div:
-                        logger.debug(f"{label}: {count_div.get_text(strip=True)}")
+                    # Look for the series count badge: <div class="text-muted small">X Serien</div>
+                    for count_div in soup.select('div.text-muted.small'):
+                        count_text = count_div.get_text(strip=True)
+                        if 'Serien' in count_text:
+                            logger.debug(f"{label}: {count_text}")
+                            count_match = re.search(r'(\d+)', count_text)
+                            if count_match:
+                                expected_count = int(count_match.group(1))
+                            break
 
                 page_found = 0
                 for link in soup.find_all('a', href=True):
@@ -1539,6 +1551,9 @@ class SToBackupScraper:
                     if not m:
                         continue
                     slug = m.group(1)
+                    if slug in seen_slugs:
+                        continue
+                    seen_slugs.add(slug)
                     title = link.get_text(strip=True) or slug
                     series_list.append({
                         'title': title,
@@ -1566,7 +1581,11 @@ class SToBackupScraper:
                 logger.warning(f"Could not scan {url}: {e}")
                 break
 
-        print(f"  ✓ {label}: {len(series_list)} series found")
+        actual_count = len(series_list)
+        if expected_count is not None and actual_count != expected_count:
+            logger.warning(f"{label}: expected {expected_count} series but scraped {actual_count}")
+            print(f"  ⚠ {label}: page says {expected_count} series but scraped {actual_count}")
+        print(f"  ✓ {label}: {actual_count} series found")
         return series_list
 
     def _get_account_series_parallel(self, account_pages, site_url):
@@ -1902,20 +1921,28 @@ class SToBackupScraper:
         Detect if user has series subscribed and/or on watchlist.
         
         Checks for active state on subscription buttons using CSS classes.
+        Returns None for a value if the corresponding button was not found
+        (page may not have loaded correctly).
         
         Returns:
-            tuple: (subscribed: bool, watchlist: bool)
+            tuple: (subscribed: bool|None, watchlist: bool|None)
         """
         try:
-            subscribed = False
-            watchlist = False
+            subscribed = None
+            watchlist = None
             
-            # Look for subscription buttons
+            # Look for subscription buttons (prefer desktop-only container to avoid
+            # scanning duplicate mobile buttons)
             sub_sel = self.get_selector('subscription') or {}
-            buttons = soup.select(sub_sel.get('action_button', '.js-action-btn'))
+            action_sel = sub_sel.get('action_button', '.js-action-btn')
+            buttons = soup.select(f'.d-none.d-md-flex {action_sel}') or soup.select(action_sel)
             active_class = sub_sel.get('active_class', 'btn-glass-primary')
             type_sub = sub_sel.get('type_subscribed', 'favorite')
             type_wl = sub_sel.get('type_watchlist', 'watchlater')
+            
+            if not buttons:
+                logger.warning("No subscription buttons found on page — cannot determine Sub/WL status")
+                return (None, None)
             
             for button in buttons:
                 data_type = button.get('data-type', '')
@@ -1924,16 +1951,21 @@ class SToBackupScraper:
                 is_active = active_class in button.get('class', []) or \
                            button.get('data-active') == '1'
                 
-                if data_type == type_sub and is_active:
-                    subscribed = True
-                elif data_type == type_wl and is_active:
-                    watchlist = True
+                if data_type == type_sub:
+                    subscribed = bool(is_active)
+                elif data_type == type_wl:
+                    watchlist = bool(is_active)
+            
+            if subscribed is None:
+                logger.warning(f"Subscribe button (type={type_sub}) not found among {len(buttons)} buttons")
+            if watchlist is None:
+                logger.warning(f"Watchlist button (type={type_wl}) not found among {len(buttons)} buttons")
             
             return (subscribed, watchlist)
             
         except Exception as e:
             print(f"    ⚠ Error detecting subscription status: {str(e)[:50]}")
-            return (False, False)
+            return (None, None)
 
     # ==================== SERIES DISCOVERY ====================
     
@@ -2451,16 +2483,19 @@ class SToBackupScraper:
         # Determine confirmed subscription/watchlist values.
         # These are series-level (not per-season), so extract once and
         # strip from individual season dicts.
+        # Use None as default when no reading is available — the caller
+        # must treat None as "could not determine" and mark the series
+        # as failed for retry instead of silently assuming False.
         if _sub_confirmed and _sub_readings:
             confirmed_sub, confirmed_wl = _sub_readings[-1]
         else:
             confirmed_sub = next(
                 (r['subscribed'] for r in season_results if r.get('subscribed') is not None),
-                False
+                None
             )
             confirmed_wl = next(
                 (r['watchlist'] for r in season_results if r.get('watchlist') is not None),
-                False
+                None
             )
 
         # Remove per-season subscription fields — they belong on the series
@@ -2625,8 +2660,8 @@ class SToBackupScraper:
                     season_results = result['season_results']
                     missing_seasons = result['missing_seasons']
                     series_title = result['title'] or display_title
-                    result_sub = result.get('subscribed', False)
-                    result_wl = result.get('watchlist', False)
+                    result_sub = result.get('subscribed')
+                    result_wl = result.get('watchlist')
                     
                     # If driver died mid-scrape and we have missing seasons, re-queue and restart
                     if missing_seasons and not self._is_driver_alive(driver):
@@ -2662,11 +2697,27 @@ class SToBackupScraper:
                     elif series_total_eps == 0 and not series_had_error:
                         logger.warning(f"W{worker_id}: {series_slug} returned 0 episodes across {len(seasons)} season(s) — marking as failed for retry")
                     
+                    # Check if subscription/watchlist status could not be determined
+                    sub_wl_missing = is_sub is None or is_wl is None
+                    if sub_wl_missing:
+                        logger.warning(f"W{worker_id}: {series_slug} missing Sub/WL status (Sub={is_sub}, WL={is_wl}) — marking as failed for retry")
+                    
                     with self._lock:
                         completed += 1
                         if series_slug not in series_data:
                             failed += 1
                             print(self._format_progress_line(completed, total_series, start_time, series_title, error='failed', worker_id=worker_id, worker_count=worker_count))
+                        elif sub_wl_missing:
+                            failed += 1
+                            self.failed_links.append(self._normalize_failed_item(item, series_url, display_title))
+                            missing_fields = []
+                            if is_sub is None:
+                                missing_fields.append('Sub')
+                            if is_wl is None:
+                                missing_fields.append('WL')
+                            print(self._format_progress_line(completed, total_series, start_time, series_title,
+                                          error=f"missing {'+'.join(missing_fields)} status",
+                                          worker_id=worker_id, worker_count=worker_count))
                         elif series_had_error:
                             failed += 1
                             self.failed_links.append(self._normalize_failed_item(item, series_url, display_title))
@@ -2908,8 +2959,8 @@ class SToBackupScraper:
                     season_results = result['season_results']
                     missing_seasons = result['missing_seasons']
                     series_title = result['title'] or display_title
-                    result_sub = result.get('subscribed', False)
-                    result_wl = result.get('watchlist', False)
+                    result_sub = result.get('subscribed')
+                    result_wl = result.get('watchlist')
                 except Exception as e:
                     logger.error(f"Unexpected error scraping seasons for {series_slug}: {e}")
                     print(self._format_progress_line(idx, total_series, start_time, display_title, error=f"crash: {str(e)[:60]}"))
@@ -2932,10 +2983,31 @@ class SToBackupScraper:
                 if series_total_eps == 0 and not series_had_error:
                     logger.warning(f"{series_slug} returned 0 episodes across {len(seasons)} season(s) — marking as failed for retry")
                 
+                # Check if subscription/watchlist status could not be determined
+                sub_wl_missing = is_sub is None or is_wl is None
+                if sub_wl_missing:
+                    logger.warning(f"{series_slug} missing Sub/WL status (Sub={is_sub}, WL={is_wl}) — marking as failed for retry")
+                    if not any(
+                        (isinstance(f, dict) and f.get('url', '').endswith(series_slug)) or f == series_slug
+                        for f in self.failed_links
+                    ):
+                        self.failed_links.append(self._normalize_failed_item(item, series_url, display_title))
+                
                 # Single-line result (progress bar + status + seasons)
                 scraped_count = len(season_results)
                 expected_count = len(seasons)
-                if series_had_error:
+                if sub_wl_missing and not series_had_error:
+                    failed += 1
+                    consecutive_series_failures += 1
+                    missing_fields = []
+                    if is_sub is None:
+                        missing_fields.append('Sub')
+                    if is_wl is None:
+                        missing_fields.append('WL')
+                    print(self._format_progress_line(idx, total_series, start_time, series_title,
+                                  error=f"missing {'+'.join(missing_fields)} status",
+                                  season_labels=seasons))
+                elif series_had_error:
                     failed += 1
                     consecutive_series_failures += 1
                     scraped_seasons = [r['season'] for r in season_results]
@@ -3003,9 +3075,18 @@ class SToBackupScraper:
                 continue
             
             # subscribed/watchlist are already set at series level by
-            # _aggregate_season_results — just ensure defaults exist.
-            series_info.setdefault('subscribed', False)
-            series_info.setdefault('watchlist', False)
+            # _aggregate_season_results.  If either is None, the page did not
+            # load correctly — skip this series (it should already be in
+            # failed_links for retry).
+            if series_info.get('subscribed') is None or series_info.get('watchlist') is None:
+                missing = []
+                if series_info.get('subscribed') is None:
+                    missing.append('Sub')
+                if series_info.get('watchlist') is None:
+                    missing.append('WL')
+                print(f"⚠ Skipping {series_slug} — missing {'+'.join(missing)} status (will retry)")
+                logger.warning(f"Skipping {series_slug} from results: missing {'+'.join(missing)} status")
+                continue
             series_info['title'] = next(
                 (s.get('title') for s in series_info['seasons'] if s.get('title')),
                 series_slug
@@ -3082,6 +3163,7 @@ class SToBackupScraper:
         """Scrape all series from the s.to/serien index page"""
         time.sleep(self.get_timing('initial_delay'))
         all_series = self.get_all_series()
+        self.all_discovered_series = all_series
 
         if self._use_parallel:
             print("→ Starting series scraping (parallel mode)...")
@@ -3097,6 +3179,7 @@ class SToBackupScraper:
         """Scrape only series not already in the index"""
         time.sleep(self.get_timing('initial_delay'))
         all_series = self.get_all_series()
+        self.all_discovered_series = all_series
 
         existing_slugs = set()
         if os.path.exists(index_file):

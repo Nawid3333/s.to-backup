@@ -4,6 +4,7 @@ S.TO Series Scraper and Index Manager
 Automatically scrapes your watched TV series from s.to and maintains a local index
 """
 
+import copy
 import json
 import logging
 import logging.handlers
@@ -18,11 +19,28 @@ from urllib.parse import urlparse
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 from config.config2 import EMAIL, PASSWORD, DATA_DIR, SERIES_INDEX_FILE, LOG_FILE
-from src.index_manager2 import IndexManager, confirm_and_save_changes
+from src.index_manager2 import IndexManager, confirm_and_save_changes, show_vanished_series, _extract_slug_from_field
 from src.scraper2 import SToBackupScraper, MAX_WORKERS
 
 # Pre-compiled regex for URL validation
 _SERIE_URL_RE = re.compile(r'/serie/[^/]+')
+
+
+def _extract_slug(entry):
+    """Extract series slug from an index entry using link (primary) or url (fallback).
+
+    Returns slug string or None if both fail.
+    """
+    slug = _extract_slug_from_field(entry.get('link', ''))
+    if slug:
+        return slug
+    slug = _extract_slug_from_field(entry.get('url', ''))
+    if slug:
+        title = entry.get('title', '?')
+        print(f"  ⚠ Used URL fallback for slug extraction: {title}")
+        logger.warning(f"Used URL fallback for slug extraction: {title}")
+        return slug
+    return None
 
 # Mode labels for checkpoint tracking
 _MODE_LABELS = {
@@ -143,6 +161,7 @@ def print_completed_series_alerts(index_manager=None):
     """Alert user about series that need attention:
     1. Fully watched but not subscribed
     2. Ongoing (started but incomplete) but not on watchlist
+    3. Not started (0 watched) but subscribed or on watchlist
     """
     try:
         if index_manager is None:
@@ -151,35 +170,41 @@ def print_completed_series_alerts(index_manager=None):
         if not index_manager.series_index:
             return
 
-        # Rule 1: Fully watched + not subscribed
+        # Rule 1: Fully watched + not subscribed + not on watchlist
         completed_not_sub = []
         # Rule 2: Ongoing + not on watchlist
         ongoing_no_wl = []
+        # Rule 3: Not started but subscribed or on watchlist
+        not_started_sub_wl = []
 
         for s in index_manager.series_index.values():
-            total = s.get('total_episodes', 0)
-            watched = s.get('watched_episodes', 0)
+            # Recalculate from actual episode data to avoid stale top-level counts
+            total = sum(len(sn.get('episodes', [])) for sn in s.get('seasons', []))
+            watched = sum(
+                sum(1 for ep in sn.get('episodes', []) if ep.get('watched', False))
+                for sn in s.get('seasons', [])
+            )
             subscribed = s.get('subscribed', False)
             watchlist = s.get('watchlist', False)
 
-            if total > 0 and watched == total and not subscribed:
+            if total > 0 and watched == total and not subscribed and not watchlist:
                 completed_not_sub.append(s)
             elif total > 0 and 0 < watched < total and not watchlist:
                 ongoing_no_wl.append(s)
+            elif total > 0 and watched == 0 and (subscribed or watchlist):
+                not_started_sub_wl.append(s)
 
-        # --- Alert 1: Fully watched + not subscribed ---
+        # --- Alert 1: Fully watched + not subscribed + not on watchlist ---
         if completed_not_sub:
             completed_not_sub.sort(key=lambda s: s.get('title', ''))
             print("\n" + "⚠"*35)
             print("⚠ COMPLETED SERIES — NOT SUBSCRIBED:")
             print("─" * 70)
             for s in completed_not_sub:
-                watched = s.get('watched_episodes', 0)
-                total = s.get('total_episodes', 0)
+                total = sum(len(sn.get('episodes', [])) for sn in s.get('seasons', []))
                 season_labels = [str(sn.get('season', '?')) for sn in s.get('seasons', [])]
                 season_info = f" [{','.join(season_labels)}]" if season_labels else ""
-                wl = "✓" if s.get('watchlist') else "✗"
-                print(f"  • {s.get('title')}{season_info}: {watched}/{total} episodes (100%) | Sub: ✗ | WL: {wl}")
+                print(f"  • {s.get('title')}{season_info}: {total}/{total} episodes (100%) | Sub: ✗ | WL: ✗")
             print("─" * 70)
             print(f"→ {len(completed_not_sub)} series fully watched but not subscribed.")
             print("  Consider subscribing or leaving as-is.")
@@ -208,8 +233,11 @@ def print_completed_series_alerts(index_manager=None):
             print("⚠ ONGOING SERIES — NOT ON WATCHLIST:")
             print("─" * 70)
             for s in ongoing_no_wl:
-                watched = s.get('watched_episodes', 0)
-                total = s.get('total_episodes', 0)
+                total = sum(len(sn.get('episodes', [])) for sn in s.get('seasons', []))
+                watched = sum(
+                    sum(1 for ep in sn.get('episodes', []) if ep.get('watched', False))
+                    for sn in s.get('seasons', [])
+                )
                 percent = round((watched / total * 100), 1) if total else 0
                 season_labels = [str(sn.get('season', '?')) for sn in s.get('seasons', [])]
                 season_info = f" [{','.join(season_labels)}]" if season_labels else ""
@@ -218,6 +246,24 @@ def print_completed_series_alerts(index_manager=None):
             print("─" * 70)
             print(f"→ {len(ongoing_no_wl)} ongoing series not on your watchlist.")
             print("  Consider adding them to your watchlist.")
+            print("⚠" * 35)
+
+        # --- Alert 3: Not started but subscribed or on watchlist ---
+        if not_started_sub_wl:
+            not_started_sub_wl.sort(key=lambda s: s.get('title', ''))
+            print("\n" + "⚠"*35)
+            print("⚠ NOT STARTED — BUT SUBSCRIBED/WATCHLIST:")
+            print("─" * 70)
+            for s in not_started_sub_wl:
+                total = sum(len(sn.get('episodes', [])) for sn in s.get('seasons', []))
+                season_labels = [str(sn.get('season', '?')) for sn in s.get('seasons', [])]
+                season_info = f" [{','.join(season_labels)}]" if season_labels else ""
+                sub = "✓" if s.get('subscribed') else "✗"
+                wl = "✓" if s.get('watchlist') else "✗"
+                print(f"  • {s.get('title')}{season_info}: 0/{total} episodes (0%) | Sub: {sub} | WL: {wl}")
+            print("─" * 70)
+            print(f"→ {len(not_started_sub_wl)} series not started but subscribed/on watchlist.")
+            print("  You may want to start watching or remove them.")
             print("⚠" * 35)
 
     except Exception as e:
@@ -277,6 +323,17 @@ def _run_scrape_and_save(run_kwargs, description, success_msg, no_data_msg):
 
         if scraper.series_data:
             index_manager = IndexManager(SERIES_INDEX_FILE)
+            
+            # Show vanished-series notification if full catalogue was fetched
+            if scraper.all_discovered_series is not None:
+                all_slugs = set()
+                for s in scraper.all_discovered_series:
+                    slug = s.get('slug') or _extract_slug(s)
+                    if slug:
+                        all_slugs.add(slug)
+                scope = 'new_only' if run_kwargs.get('new_only') else 'all'
+                show_vanished_series(index_manager.series_index, all_slugs, scope)
+            
             if confirm_and_save_changes(scraper.series_data, description, index_manager):
                 print(f"\n✓ {success_msg}")
                 print_scraped_series_status()
@@ -531,6 +588,58 @@ def _show_ongoing_and_export(report, index_manager):
             logger.error(f"Failed to export URLs: {e}")
 
 
+def _print_report_summary(report, report_file, filter_name=None):
+    """Print enhanced report summary to console."""
+    stats = report['metadata']['statistics']
+    ongoing_count = report['categories']['ongoing']['count']
+    not_started_count = report['categories']['not_started']['count']
+    not_started_sub_wl_count = report['categories']['not_started_subscribed_watchlist']['count']
+
+    header = f"REPORT SUMMARY ({filter_name.upper().replace('_', ' ')}):" if filter_name else "REPORT SUMMARY:"
+    print(f"\n" + "-"*70)
+    print(header)
+    print("-"*70)
+    print(f"  Total series:        {stats['total_series']}")
+    print(f"  Watched (100%):      {stats['watched']} ({stats.get('watched_percentage', 0):.1f}%)")
+    print(f"  Unwatched:           {stats.get('unwatched', 0)}")
+    print(f"  Ongoing (started):   {ongoing_count}")
+    print(f"  Not started:         {not_started_count}")
+    if not_started_sub_wl_count > 0:
+        print(f"  Not started (Sub/WL):{not_started_sub_wl_count}")
+    print(f"  Total episodes:      {stats['total_episodes']}")
+    print(f"  Watched episodes:    {stats['watched_episodes']}")
+    print(f"  Unwatched episodes:  {stats.get('unwatched_episodes', 0)}")
+    print(f"  Avg episodes/series: {stats.get('average_episodes_per_series', 0)}")
+    print(f"  Average completion:  {stats['average_completion']:.1f}%")
+    print(f"  Subscribed:          {stats.get('subscribed_count', 0)}")
+    print(f"  Watchlist:           {stats.get('watchlist_count', 0)}")
+    print(f"  Both (Sub+WL):       {stats.get('both_subscribed_and_watchlist', 0)}")
+
+    # Completion distribution
+    dist = stats.get('completion_distribution', {})
+    if dist:
+        parts = [f"{k}: {v}" for k, v in dist.items()]
+        print(f"\n  Completion Distribution:")
+        print(f"    {'  |  '.join(parts)}")
+
+    # Most completed series
+    most = stats.get('most_completed_series', [])
+    if most:
+        print(f"\n  Most Completed (top {len(most)}):")
+        for i, s in enumerate(most, 1):
+            print(f"    {i}. {s['title']} \u2014 {s['completion']:.1f}% ({s['progress']})")
+
+    # Least completed series
+    least = stats.get('least_completed_series', [])
+    if least:
+        print(f"  Least Completed (bottom {len(least)}):")
+        for i, s in enumerate(least, 1):
+            print(f"    {i}. {s['title']} \u2014 {s['completion']:.1f}% ({s['progress']})")
+
+    print(f"\n  Saved to:            {report_file}")
+    print("-"*70 + "\n")
+
+
 def generate_report():
     """Generate series report with optional filtering by subscription status"""
     print("\n→ Generate report")
@@ -555,24 +664,7 @@ def generate_report():
             with open(report_file, 'w', encoding='utf-8') as f:
                 json.dump(report, f, indent=2, ensure_ascii=False)
             
-            # Display summary
-            stats = report['metadata']['statistics']
-            print(f"\n" + "-"*70)
-            print("REPORT SUMMARY:")
-            print("-"*70)
-            print(f"  Total series:        {stats['total_series']}")
-            print(f"  Watched (100%):      {stats['watched']}")
-            ongoing_count = report['categories']['ongoing']['count']
-            not_started_count = report['categories']['not_started']['count']
-            print(f"  Ongoing (started):   {ongoing_count}")
-            print(f"  Not started:         {not_started_count}")
-            print(f"  Total episodes:      {stats['total_episodes']}")
-            print(f"  Watched episodes:    {stats['watched_episodes']}")
-            print(f"  Average completion:  {stats['average_completion']:.1f}%")
-            print(f"  Subscribed:          {stats.get('subscribed_count', 0)}")
-            print(f"  Watchlist:           {stats.get('watchlist_count', 0)}")
-            print(f"  Saved to:            {report_file}")
-            print("-"*70 + "\n")
+            _print_report_summary(report, report_file)
             logger.info("Full report generated")
             
             print_completed_series_alerts(index_manager)
@@ -614,22 +706,7 @@ def generate_report():
             with open(report_file, 'w', encoding='utf-8') as f:
                 json.dump(report, f, indent=2, ensure_ascii=False)
             
-            # Display summary
-            stats = report['metadata']['statistics']
-            print(f"\n" + "-"*70)
-            print(f"REPORT SUMMARY ({filter_name.upper().replace('_', ' ')}):")
-            print("-"*70)
-            print(f"  Total series:        {stats['total_series']}")
-            print(f"  Watched (100%):      {stats['watched']}")
-            ongoing_count = report['categories']['ongoing']['count']
-            not_started_count = report['categories']['not_started']['count']
-            print(f"  Ongoing (started):   {ongoing_count}")
-            print(f"  Not started:         {not_started_count}")
-            print(f"  Total episodes:      {stats['total_episodes']}")
-            print(f"  Watched episodes:    {stats['watched_episodes']}")
-            print(f"  Average completion:  {stats['average_completion']:.1f}%")
-            print(f"  Saved to:            {report_file}")
-            print("-"*70 + "\n")
+            _print_report_summary(report, report_file, filter_name)
             logger.info(f"Filtered report generated: {filter_name}")
             
             print_completed_series_alerts(index_manager)
@@ -687,6 +764,22 @@ def scrape_subscribed_watchlist():
             print("\n⚠ No series found on your account pages.")
             return
         
+        # Detect series that disappeared from account pages (for flag flipping later)
+        discovered_slugs = {s.get('slug', '') for s in account_series if s.get('slug')}
+        pre_index = IndexManager(SERIES_INDEX_FILE)
+        disappeared_watchlist = []
+        disappeared_subscribed = []
+        for title, entry in pre_index.series_index.items():
+            slug = _extract_slug(entry)
+            if slug is None:
+                continue
+            if slug in discovered_slugs:
+                continue
+            if source in ('watchlist', 'both') and entry.get('watchlist', False):
+                disappeared_watchlist.append((title, entry))
+            if source in ('subscribed', 'both') and entry.get('subscribed', False):
+                disappeared_subscribed.append((title, entry))
+        
         scraper.set_checkpoint_paths(os.path.dirname(output_file))
         scraper._checkpoint_mode = source
         
@@ -707,6 +800,72 @@ def scrape_subscribed_watchlist():
         raw = scraper._scrape_series_parallel(account_series, MAX_WORKERS)
         scraper.series_data = scraper._finalize_series_data(raw)
         scraper.clear_checkpoint()
+        
+        # Inject stubs for series that disappeared from account pages (flag flipping)
+        failed_slugs = set()
+        for fl in scraper.failed_links:
+            fs = _extract_slug(fl) if isinstance(fl, dict) else None
+            if fs:
+                failed_slugs.add(fs)
+        
+        # Build set of already-scraped titles to avoid duplicates
+        scraped_titles = set()
+        if isinstance(scraper.series_data, dict):
+            scraped_titles = set(scraper.series_data.keys())
+        elif isinstance(scraper.series_data, list):
+            scraped_titles = {s.get('title') for s in scraper.series_data if s.get('title')}
+        
+        injected_count_wl = 0
+        injected_count_sub = 0
+        
+        for title, entry in disappeared_watchlist:
+            slug = _extract_slug(entry)
+            if slug and slug in failed_slugs:
+                continue
+            if title in scraped_titles:
+                continue
+            stub = copy.deepcopy(entry)
+            stub['watchlist'] = False
+            if isinstance(scraper.series_data, dict):
+                scraper.series_data[title] = stub
+            elif isinstance(scraper.series_data, list):
+                scraper.series_data.append(stub)
+            scraped_titles.add(title)
+            injected_count_wl += 1
+        
+        for title, entry in disappeared_subscribed:
+            slug = _extract_slug(entry)
+            if slug and slug in failed_slugs:
+                continue
+            if title in scraped_titles:
+                # Already injected (e.g. from watchlist pass) — just flip the sub flag
+                if isinstance(scraper.series_data, dict) and title in scraper.series_data:
+                    scraper.series_data[title]['subscribed'] = False
+                elif isinstance(scraper.series_data, list):
+                    for item in scraper.series_data:
+                        if item.get('title') == title:
+                            item['subscribed'] = False
+                            break
+                continue
+            stub = copy.deepcopy(entry)
+            stub['subscribed'] = False
+            if isinstance(scraper.series_data, dict):
+                scraper.series_data[title] = stub
+            elif isinstance(scraper.series_data, list):
+                scraper.series_data.append(stub)
+            scraped_titles.add(title)
+            injected_count_sub += 1
+        
+        if injected_count_wl > 0:
+            print(f"  ⚠ {injected_count_wl} series no longer on watchlist (will prompt for confirmation)")
+        if injected_count_sub > 0:
+            print(f"  ⚠ {injected_count_sub} series no longer subscribed (will prompt for confirmation)")
+        
+        # Show vanished-series informational notification
+        # Exclude series already handled by flag flipping above (they'll appear in change prompts)
+        handled_titles = {t for t, _ in disappeared_watchlist} | {t for t, _ in disappeared_subscribed}
+        vanished_index = {t: e for t, e in pre_index.series_index.items() if t not in handled_titles}
+        show_vanished_series(vanished_index, discovered_slugs, source)
         
         if scraper.series_data:
             index_manager = IndexManager(SERIES_INDEX_FILE)

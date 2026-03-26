@@ -294,8 +294,10 @@ def detect_changes(old_data, new_data):
         "new_episodes": [],
         "newly_watched": [],
         "newly_unwatched": [],
-        "subscription_changed": [],
-        "watchlist_changed": [],
+        "newly_subscribed": [],
+        "newly_unsubscribed": [],
+        "watchlist_added": [],
+        "watchlist_removed": [],
         "title_ger_changed": [],
         "title_eng_changed": []
     }
@@ -322,13 +324,19 @@ def detect_changes(old_data, new_data):
         old_sub = old_series.get('subscribed', False)
         new_sub = new_series.get('subscribed', False)
         if old_sub != new_sub:
-            changes["subscription_changed"].append((title, old_sub, new_sub))
+            if new_sub:
+                changes["newly_subscribed"].append(title)
+            else:
+                changes["newly_unsubscribed"].append(title)
         
         # Watchlist changes
         old_wl = old_series.get('watchlist', False)
         new_wl = new_series.get('watchlist', False)
         if old_wl != new_wl:
-            changes["watchlist_changed"].append((title, old_wl, new_wl))
+            if new_wl:
+                changes["watchlist_added"].append(title)
+            else:
+                changes["watchlist_removed"].append(title)
         
         # Title German changes
         old_ger = old_series.get('title_ger', '')
@@ -367,7 +375,8 @@ def detect_changes(old_data, new_data):
 
 
 def show_changes(changes, include_unwatched=True, include_watched=True,
-                 include_subscription=True, include_watchlist=True, new_data=None):
+                 include_subscribe=True, include_unsubscribe=True,
+                 include_watchlist_add=True, include_watchlist_remove=True, new_data=None):
     """Display changes with pagination and smart season grouping."""
     total = 0
     for k, v in changes.items():
@@ -375,9 +384,13 @@ def show_changes(changes, include_unwatched=True, include_watched=True,
             continue
         if k == 'newly_watched' and not include_watched:
             continue
-        if k == 'subscription_changed' and not include_subscription:
+        if k == 'newly_subscribed' and not include_subscribe:
             continue
-        if k == 'watchlist_changed' and not include_watchlist:
+        if k == 'newly_unsubscribed' and not include_unsubscribe:
+            continue
+        if k == 'watchlist_added' and not include_watchlist_add:
+            continue
+        if k == 'watchlist_removed' and not include_watchlist_remove:
             continue
         total += len(v)
     if total == 0:
@@ -423,18 +436,32 @@ def show_changes(changes, include_unwatched=True, include_watched=True,
         unwatched_lines = group_episodes_by_season(changes["newly_unwatched"], new_data, prefix='[!]')
         paginate_list(unwatched_lines, lambda line: line)
 
-    if changes.get("subscription_changed") and include_subscription:
-        print(f"\n[SUBSCRIPTION CHANGED] ({len(changes['subscription_changed'])} series)")
+    if changes.get("newly_subscribed") and include_subscribe:
+        print(f"\n[NEWLY SUBSCRIBED] ({len(changes['newly_subscribed'])} series)")
         paginate_list(
-            changes["subscription_changed"],
-            lambda x: f"  [~] {x[0]}: {'subscribed' if x[2] else 'unsubscribed'}"
+            changes["newly_subscribed"],
+            lambda x: f"  [+] {x}"
         )
 
-    if changes.get("watchlist_changed") and include_watchlist:
-        print(f"\n[WATCHLIST CHANGED] ({len(changes['watchlist_changed'])} series)")
+    if changes.get("newly_unsubscribed") and include_unsubscribe:
+        print(f"\n[NEWLY UNSUBSCRIBED] ({len(changes['newly_unsubscribed'])} series)")
         paginate_list(
-            changes["watchlist_changed"],
-            lambda x: f"  [~] {x[0]}: {'added to watchlist' if x[2] else 'removed from watchlist'}"
+            changes["newly_unsubscribed"],
+            lambda x: f"  [-] {x}"
+        )
+
+    if changes.get("watchlist_added") and include_watchlist_add:
+        print(f"\n[ADDED TO WATCHLIST] ({len(changes['watchlist_added'])} series)")
+        paginate_list(
+            changes["watchlist_added"],
+            lambda x: f"  [+] {x}"
+        )
+
+    if changes.get("watchlist_removed") and include_watchlist_remove:
+        print(f"\n[REMOVED FROM WATCHLIST] ({len(changes['watchlist_removed'])} series)")
+        paginate_list(
+            changes["watchlist_removed"],
+            lambda x: f"  [-] {x}"
         )
 
     if changes.get("title_ger_changed"):
@@ -637,16 +664,25 @@ class IndexManager:
                 series_progress = [s for s in series_progress if s['watchlist'] == filter_watchlist]
         
         # Categorize series
-        # Watchlist series are always "ongoing" (expecting future episodes), even at 100%
+        # Watchlist/subscribed series with watched > 0 are "ongoing" (expecting future episodes)
         watched_series = [s for s in series_progress if not s['is_incomplete'] and not s.get('watchlist')]
         ongoing_series = [
             s for s in series_progress
-            if s.get('watchlist') or (s['is_incomplete'] and s['watched_episodes'] > 0)
+            if s['watched_episodes'] > 0
+            and (s.get('watchlist') or (s['is_incomplete'] and s['watched_episodes'] > 0))
         ]
         not_started_series = [
             s for s in series_progress
             if s['is_incomplete'] and s['watched_episodes'] == 0 and not s.get('watchlist')
+            and not s.get('subscribed')
         ]
+        # Not started but subscribed or on watchlist
+        not_started_sub_wl = [
+            s for s in series_progress
+            if s['watched_episodes'] == 0 and s['total_episodes'] > 0
+            and (s.get('subscribed') or s.get('watchlist'))
+        ]
+        not_started_sub_wl_sorted = sorted(not_started_sub_wl, key=lambda x: x['title'])
         # Surprise: subscribed (not watchlist) series that have new unwatched episodes
         surprise_series = [
             s for s in series_progress
@@ -701,6 +737,16 @@ class IndexManager:
                                  'progress': f"{s['watched_episodes']}/{s['total_episodes']}",
                                  'seasons': s.get('season_labels', [])}
                                 for s in surprise_sorted]
+                },
+                'not_started_subscribed_watchlist': {
+                    'count': len(not_started_sub_wl),
+                    'titles': [s['title'] for s in not_started_sub_wl_sorted],
+                    'details': [{'title': s['title'],
+                                 'total_episodes': s['total_episodes'],
+                                 'subscribed': s['subscribed'],
+                                 'watchlist': s['watchlist'],
+                                 'seasons': s.get('season_labels', [])}
+                                for s in not_started_sub_wl_sorted]
                 }
             },
             'insights': {
@@ -729,8 +775,10 @@ def _prompt_change_confirmations(changes, new_dict):
     allowed = {
         'watched': False,
         'unwatched': False,
-        'subscription': False,
-        'watchlist': False,
+        'subscribe': False,
+        'unsubscribe': False,
+        'watchlist_add': False,
+        'watchlist_remove': False,
         'title_ger': False,
         'title_eng': False,
     }
@@ -789,39 +837,69 @@ def _prompt_change_confirmations(changes, new_dict):
             print("  -> Unwatched changes will be ignored (episodes stay watched)")
             logger.info("User denied unwatched changes.")
 
-    # Confirm subscription changes
-    if changes['subscription_changed']:
-        print(f"\n[~] {len(changes['subscription_changed'])} series subscription(s) changed")
+    # Confirm newly subscribed
+    if changes['newly_subscribed']:
+        print(f"\n[+] {len(changes['newly_subscribed'])} series newly SUBSCRIBED")
         print("   (manual confirmation required)")
         print("\n" + "-"*70)
-        for title, old_val, new_val in changes['subscription_changed']:
-            arrow = "subscribed" if new_val else "unsubscribed"
-            print(f"  [~] {title}: {arrow}")
+        for title in changes['newly_subscribed']:
+            print(f"  [+] {title}")
         print("-"*70)
-        resp = input("\nAllow subscription changes? (y/n): ").strip().lower()
+        resp = input("\nAllow these series to be marked as SUBSCRIBED? (y/n): ").strip().lower()
         if resp == 'y':
-            allowed['subscription'] = True
-            logger.info("User allowed subscription changes.")
+            allowed['subscribe'] = True
+            logger.info("User allowed subscribe changes.")
         else:
-            print("  -> Subscription changes will be ignored")
-            logger.info("User denied subscription changes.")
+            print("  -> Subscribe changes will be ignored")
+            logger.info("User denied subscribe changes.")
 
-    # Confirm watchlist changes
-    if changes['watchlist_changed']:
-        print(f"\n[~] {len(changes['watchlist_changed'])} series watchlist status changed")
+    # Confirm newly unsubscribed
+    if changes['newly_unsubscribed']:
+        print(f"\n[-] {len(changes['newly_unsubscribed'])} series UNSUBSCRIBED")
         print("   (manual confirmation required)")
         print("\n" + "-"*70)
-        for title, old_val, new_val in changes['watchlist_changed']:
-            arrow = "added to watchlist" if new_val else "removed from watchlist"
-            print(f"  [~] {title}: {arrow}")
+        for title in changes['newly_unsubscribed']:
+            print(f"  [-] {title}")
         print("-"*70)
-        resp = input("\nAllow watchlist changes? (y/n): ").strip().lower()
+        resp = input("\nAllow these series to be marked as UNSUBSCRIBED? (y/n): ").strip().lower()
         if resp == 'y':
-            allowed['watchlist'] = True
-            logger.info("User allowed watchlist changes.")
+            allowed['unsubscribe'] = True
+            logger.info("User allowed unsubscribe changes.")
         else:
-            print("  -> Watchlist changes will be ignored")
-            logger.info("User denied watchlist changes.")
+            print("  -> Unsubscribe changes will be ignored")
+            logger.info("User denied unsubscribe changes.")
+
+    # Confirm added to watchlist
+    if changes['watchlist_added']:
+        print(f"\n[+] {len(changes['watchlist_added'])} series ADDED TO WATCHLIST")
+        print("   (manual confirmation required)")
+        print("\n" + "-"*70)
+        for title in changes['watchlist_added']:
+            print(f"  [+] {title}")
+        print("-"*70)
+        resp = input("\nAllow these series to be added to WATCHLIST? (y/n): ").strip().lower()
+        if resp == 'y':
+            allowed['watchlist_add'] = True
+            logger.info("User allowed watchlist add changes.")
+        else:
+            print("  -> Watchlist add changes will be ignored")
+            logger.info("User denied watchlist add changes.")
+
+    # Confirm removed from watchlist
+    if changes['watchlist_removed']:
+        print(f"\n[-] {len(changes['watchlist_removed'])} series REMOVED FROM WATCHLIST")
+        print("   (manual confirmation required)")
+        print("\n" + "-"*70)
+        for title in changes['watchlist_removed']:
+            print(f"  [-] {title}")
+        print("-"*70)
+        resp = input("\nAllow these series to be removed from WATCHLIST? (y/n): ").strip().lower()
+        if resp == 'y':
+            allowed['watchlist_remove'] = True
+            logger.info("User allowed watchlist remove changes.")
+        else:
+            print("  -> Watchlist remove changes will be ignored")
+            logger.info("User denied watchlist remove changes.")
 
     # Confirm title_ger changes
     if changes['title_ger_changed']:
@@ -917,10 +995,23 @@ def _build_merged_data(old_data, new_dict, allowed):
                 old_entry['link'] = new_link
             elif new_link:
                 logger.warning(f"Rejected invalid link during merge for '{title}': {new_link[:80]}")
-            if allowed['subscription'] and 'subscribed' in new_entry:
-                old_entry['subscribed'] = new_entry['subscribed']
-            if allowed['watchlist'] and 'watchlist' in new_entry:
-                old_entry['watchlist'] = new_entry['watchlist']
+            if 'subscribed' in new_entry:
+                old_sub = old_entry.get('subscribed', False)
+                new_sub = new_entry['subscribed']
+                if old_sub != new_sub:
+                    if new_sub and allowed['subscribe']:
+                        old_entry['subscribed'] = True
+                    elif not new_sub and allowed['unsubscribe']:
+                        old_entry['subscribed'] = False
+                # If unchanged, keep as-is (no action needed)
+            if 'watchlist' in new_entry:
+                old_wl = old_entry.get('watchlist', False)
+                new_wl = new_entry['watchlist']
+                if old_wl != new_wl:
+                    if new_wl and allowed['watchlist_add']:
+                        old_entry['watchlist'] = True
+                    elif not new_wl and allowed['watchlist_remove']:
+                        old_entry['watchlist'] = False
             if allowed['title_ger'] and 'title_ger' in new_entry:
                 old_entry['title_ger'] = new_entry['title_ger']
             if allowed['title_eng'] and 'title_eng' in new_entry:
@@ -949,8 +1040,15 @@ def _build_merged_data(old_data, new_dict, allowed):
             }
         else:
             # New entry: build with proper field order
-            new_entry.setdefault('subscribed', False)
-            new_entry.setdefault('watchlist', False)
+            # Do not default subscribed/watchlist to False — if they are missing
+            # (None), the series should have been filtered out by _finalize_series_data.
+            # Only set default if the key is truly absent (legacy data).
+            if 'subscribed' not in new_entry:
+                logger.warning(f"New entry '{title}' missing 'subscribed' field — setting to False")
+                new_entry['subscribed'] = False
+            if 'watchlist' not in new_entry:
+                logger.warning(f"New entry '{title}' missing 'watchlist' field — setting to False")
+                new_entry['watchlist'] = False
             new_entry.setdefault('alt_titles', [])
             new_entry['added_date'] = datetime.now().isoformat()
             seasons = new_entry.pop('seasons', [])
@@ -958,6 +1056,104 @@ def _build_merged_data(old_data, new_dict, allowed):
             merged[title] = new_entry
 
     return merged
+
+
+def _extract_slug_from_field(value):
+    """Extract series slug from a link or URL field containing '/serie/'.
+
+    Returns the slug string, or None if extraction fails.
+    """
+    if not value or not isinstance(value, str):
+        return None
+    idx = value.find('/serie/')
+    if idx == -1:
+        return None
+    slug = value[idx + len('/serie/'):].strip('/').split('/')[0]
+    return slug if slug else None
+
+
+def show_vanished_series(old_data, all_discovered_slugs, scrape_scope):
+    """Show informational notification about previously indexed series not found in the current scrape.
+
+    This is purely informational — no index changes are made.
+
+    Args:
+        old_data: dict of old series index (title -> series dict)
+        all_discovered_slugs: set of slugs discovered in the current scrape
+        scrape_scope: str indicating scrape mode:
+            'all' / 'new_only' — full s.to catalogue was fetched, show all vanished
+            'watchlist' — only show vanished with watchlist=True
+            'subscribed' — only show vanished with subscribed=True
+            'both' — show vanished with either flag; annotate if both were True
+            None / other — suppress notification (partial scrape)
+
+    Returns:
+        list of (title, reason) tuples for vanished series, or empty list
+    """
+    if scrape_scope not in ('all', 'new_only', 'watchlist', 'subscribed', 'both'):
+        return []
+
+    vanished = []
+    corrupt_entries = []
+
+    for title, entry in old_data.items():
+        # Extract slug from index entry
+        slug = _extract_slug_from_field(entry.get('link', ''))
+        if slug is None:
+            slug = _extract_slug_from_field(entry.get('url', ''))
+            if slug is not None:
+                logger.warning(f"Used URL fallback for slug extraction: {title}")
+            else:
+                corrupt_entries.append(title)
+                continue
+
+        if slug in all_discovered_slugs:
+            continue  # Still exists, not vanished
+
+        # Filter by scope
+        is_sub = entry.get('subscribed', False)
+        is_wl = entry.get('watchlist', False)
+
+        if scrape_scope in ('all', 'new_only'):
+            vanished.append((title, 'not found on s.to'))
+        elif scrape_scope == 'watchlist':
+            if is_wl:
+                vanished.append((title, 'was on watchlist'))
+        elif scrape_scope == 'subscribed':
+            if is_sub:
+                vanished.append((title, 'was subscribed'))
+        elif scrape_scope == 'both':
+            if is_sub and is_wl:
+                vanished.append((title, 'was subscribed + on watchlist — possibly deleted from s.to'))
+            elif is_sub:
+                vanished.append((title, 'was subscribed'))
+            elif is_wl:
+                vanished.append((title, 'was on watchlist'))
+
+    # Print corrupt entries warning
+    if corrupt_entries:
+        print(f"\n⚠ {len(corrupt_entries)} index entry(s) have corrupt/missing URL data:")
+        for t in corrupt_entries[:10]:
+            print(f"  • {t}")
+        if len(corrupt_entries) > 10:
+            print(f"  ... and {len(corrupt_entries) - 10} more")
+        print("  These entries were skipped during vanished-series detection.")
+        logger.warning(f"Corrupt URL data in {len(corrupt_entries)} index entries: {corrupt_entries[:5]}")
+
+    # Print vanished series notification
+    if vanished:
+        print(f"\n{'─'*70}")
+        print(f"  [INFO] {len(vanished)} previously indexed series NOT found in current scrape:")
+        print(f"{'─'*70}")
+        for title, reason in vanished[:20]:
+            print(f"  • {title}  ({reason})")
+        if len(vanished) > 20:
+            print(f"  ... and {len(vanished) - 20} more")
+        print(f"{'─'*70}")
+        print("  These series are preserved unchanged in the index.")
+        logger.info(f"Vanished series notification: {len(vanished)} series not found in scrape scope '{scrape_scope}'")
+
+    return vanished
 
 
 def confirm_and_save_changes(new_data, description, index_manager):
@@ -992,10 +1188,14 @@ def confirm_and_save_changes(new_data, description, index_manager):
         changes['newly_watched'] = []
     if not allowed['unwatched']:
         changes['newly_unwatched'] = []
-    if not allowed['subscription']:
-        changes['subscription_changed'] = []
-    if not allowed['watchlist']:
-        changes['watchlist_changed'] = []
+    if not allowed['subscribe']:
+        changes['newly_subscribed'] = []
+    if not allowed['unsubscribe']:
+        changes['newly_unsubscribed'] = []
+    if not allowed['watchlist_add']:
+        changes['watchlist_added'] = []
+    if not allowed['watchlist_remove']:
+        changes['watchlist_removed'] = []
     if not allowed['title_ger']:
         changes['title_ger_changed'] = []
     if not allowed['title_eng']:
@@ -1006,13 +1206,18 @@ def confirm_and_save_changes(new_data, description, index_manager):
     
     # Step 3: Check if there are remaining changes to save
     main_changes = sum(len(v) for k, v in changes.items()
-                       if k not in ('newly_unwatched', 'subscription_changed', 'watchlist_changed'))
+                       if k not in ('newly_unwatched', 'newly_subscribed', 'newly_unsubscribed',
+                                    'watchlist_added', 'watchlist_removed'))
     if allowed['unwatched']:
         main_changes += len(changes['newly_unwatched'])
-    if allowed['subscription']:
-        main_changes += len(changes['subscription_changed'])
-    if allowed['watchlist']:
-        main_changes += len(changes['watchlist_changed'])
+    if allowed['subscribe']:
+        main_changes += len(changes['newly_subscribed'])
+    if allowed['unsubscribe']:
+        main_changes += len(changes['newly_unsubscribed'])
+    if allowed['watchlist_add']:
+        main_changes += len(changes['watchlist_added'])
+    if allowed['watchlist_remove']:
+        main_changes += len(changes['watchlist_removed'])
     if main_changes == 0:
         print(f"\n✓ {description} already up to date.")
         logger.info(f"No changes to save for {description}.")
@@ -1020,7 +1225,9 @@ def confirm_and_save_changes(new_data, description, index_manager):
     
     # Display remaining changes (watched/unwatched/subscription/watchlist already handled above)
     show_changes(changes, include_unwatched=False, include_watched=False,
-                    include_subscription=False, include_watchlist=False, new_data=new_dict)
+                    include_subscribe=False, include_unsubscribe=False,
+                    include_watchlist_add=False, include_watchlist_remove=False,
+                    new_data=new_dict)
     
     response = input(f"\nSave these changes? (y/n): ").strip().lower()
     if response != 'y':
