@@ -10,7 +10,6 @@ import os
 import re
 import shutil
 import tempfile
-import threading
 import time
 from collections import defaultdict
 from datetime import datetime

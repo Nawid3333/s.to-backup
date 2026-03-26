@@ -28,16 +28,14 @@ from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.firefox.service import Service as FirefoxService
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.common.exceptions import TimeoutException, WebDriverException
 
 # Add parent directory to path to access config
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from config.config2 import (
     SELECTORS_CONFIG, EMAIL, PASSWORD, HEADLESS, DATA_DIR,
-    HTTP_REQUEST_TIMEOUT, PAGE_LOAD_TIMEOUT, ELEMENT_FIND_TIMEOUT,
-    DRIVER_QUIT_TIMEOUT, MAX_LOGIN_RETRIES, MAX_SEASON_DETECTION_RETRIES,
-    MAX_EPISODE_SCRAPE_RETRIES, MAX_TOTAL_RETRIES
+    HTTP_REQUEST_TIMEOUT, PAGE_LOAD_TIMEOUT,
+    DRIVER_QUIT_TIMEOUT, MAX_TOTAL_RETRIES
 )
 
 logger = logging.getLogger(__name__)
