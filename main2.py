@@ -140,8 +140,10 @@ def print_scraped_series_status():
 
 
 def print_completed_series_alerts(index_manager=None):
-    """Alert user about series that are 100% watched but not subscribed and not on watchlist.
-    These need manual attention — the user should decide whether to subscribe, add to watchlist, or ignore."""
+    """Alert user about series that need attention:
+    1. Fully watched but not subscribed
+    2. Ongoing (started but incomplete) but not on watchlist
+    """
     try:
         if index_manager is None:
             index_manager = IndexManager(SERIES_INDEX_FILE)
@@ -149,49 +151,77 @@ def print_completed_series_alerts(index_manager=None):
         if not index_manager.series_index:
             return
 
-        alert_series = []
+        # Rule 1: Fully watched + not subscribed
+        completed_not_sub = []
+        # Rule 2: Ongoing + not on watchlist
+        ongoing_no_wl = []
+
         for s in index_manager.series_index.values():
             total = s.get('total_episodes', 0)
             watched = s.get('watched_episodes', 0)
-            if total > 0 and watched == total and not s.get('subscribed') and not s.get('watchlist'):
-                alert_series.append(s)
+            subscribed = s.get('subscribed', False)
+            watchlist = s.get('watchlist', False)
 
-        if not alert_series:
-            return
+            if total > 0 and watched == total and not subscribed:
+                completed_not_sub.append(s)
+            elif total > 0 and 0 < watched < total and not watchlist:
+                ongoing_no_wl.append(s)
 
-        alert_series.sort(key=lambda s: s.get('title', ''))
+        # --- Alert 1: Fully watched + not subscribed ---
+        if completed_not_sub:
+            completed_not_sub.sort(key=lambda s: s.get('title', ''))
+            print("\n" + "⚠"*35)
+            print("⚠ COMPLETED SERIES — NOT SUBSCRIBED:")
+            print("─" * 70)
+            for s in completed_not_sub:
+                watched = s.get('watched_episodes', 0)
+                total = s.get('total_episodes', 0)
+                season_labels = [str(sn.get('season', '?')) for sn in s.get('seasons', [])]
+                season_info = f" [{','.join(season_labels)}]" if season_labels else ""
+                wl = "✓" if s.get('watchlist') else "✗"
+                print(f"  • {s.get('title')}{season_info}: {watched}/{total} episodes (100%) | Sub: ✗ | WL: {wl}")
+            print("─" * 70)
+            print(f"→ {len(completed_not_sub)} series fully watched but not subscribed.")
+            print("  Consider subscribing or leaving as-is.")
+            print("⚠" * 35)
 
-        print("\n" + "⚠"*35)
-        print("⚠ COMPLETED SERIES — ACTION NEEDED:")
-        print("─" * 70)
-        for s in alert_series:
-            watched = s.get('watched_episodes', 0)
-            total = s.get('total_episodes', 0)
-            season_labels = [str(sn.get('season', '?')) for sn in s.get('seasons', [])]
-            season_info = f" [{','.join(season_labels)}]" if season_labels else ""
-            print(f"  • {s.get('title')}{season_info}: {watched}/{total} episodes (100%) | Sub: ✗ | WL: ✗")
-        print("─" * 70)
-        print(f"→ {len(alert_series)} series fully watched but not subscribed or on your watchlist.")
-        print("  Consider subscribing, adding to watchlist, or leaving as-is.")
-        print("⚠" * 35)
+            # Offer to rescrape these series
+            rescrape = input("\nRescrape these series to update Sub/WL status? (y/n): ").strip().lower()
+            if rescrape == 'y':
+                urls = [s.get('url') for s in completed_not_sub if s.get('url')]
+                if not urls:
+                    print("✗ No URLs found for these series")
+                else:
+                    print(f"\n→ Rescraping {len(urls)} completed series...")
+                    print("  (Browser will open - do not close it manually)\n")
+                    _run_scrape_and_save(
+                        run_kwargs=dict(url_list=urls, parallel=False),
+                        description=f"Rescrape completed series ({len(urls)})",
+                        success_msg=f"Rescrape completed! {len(urls)} series updated.",
+                        no_data_msg="No data scraped",
+                    )
 
-        # Offer to rescrape these series
-        rescrape = input("\nRescrape these series to update Sub/WL status? (y/n): ").strip().lower()
-        if rescrape == 'y':
-            urls = [s.get('url') for s in alert_series if s.get('url')]
-            if not urls:
-                print("✗ No URLs found for these series")
-                return
-            print(f"\n→ Rescraping {len(urls)} completed series...")
-            print("  (Browser will open - do not close it manually)\n")
-            _run_scrape_and_save(
-                run_kwargs=dict(url_list=urls, parallel=False),
-                description=f"Rescrape completed series ({len(urls)})",
-                success_msg=f"Rescrape completed! {len(urls)} series updated.",
-                no_data_msg="No data scraped",
-            )
+        # --- Alert 2: Ongoing + not on watchlist ---
+        if ongoing_no_wl:
+            ongoing_no_wl.sort(key=lambda s: s.get('title', ''))
+            print("\n" + "⚠"*35)
+            print("⚠ ONGOING SERIES — NOT ON WATCHLIST:")
+            print("─" * 70)
+            for s in ongoing_no_wl:
+                watched = s.get('watched_episodes', 0)
+                total = s.get('total_episodes', 0)
+                percent = round((watched / total * 100), 1) if total else 0
+                season_labels = [str(sn.get('season', '?')) for sn in s.get('seasons', [])]
+                season_info = f" [{','.join(season_labels)}]" if season_labels else ""
+                sub = "✓" if s.get('subscribed') else "✗"
+                print(f"  • {s.get('title')}{season_info}: {watched}/{total} episodes ({percent}%) | Sub: {sub} | WL: ✗")
+            print("─" * 70)
+            print(f"→ {len(ongoing_no_wl)} ongoing series not on your watchlist.")
+            print("  Consider adding them to your watchlist.")
+            print("⚠" * 35)
+
     except Exception as e:
-        logger.error(f"Error printing completed series alerts: {e}")
+        logger.error(f"Error printing series alerts: {e}")
 
 
 def check_disk_space(min_mb=100):
@@ -298,9 +328,12 @@ def scrape_all_series():
     
     print("\nScraping mode:")
     print("  1. Sequential (slower, but most reliable)")
-    print("  2. Parallel (faster, uses multiple workers)\n")
-    mode_choice = input("Choose mode (1-2) [default: 2]: ").strip() or '2'
+    print("  2. Parallel (faster, uses multiple workers)")
+    print("  0. Back\n")
+    mode_choice = input("Choose mode (0-2) [default: 2]: ").strip() or '2'
     
+    if mode_choice == '0':
+        return
     if mode_choice not in ['1', '2']:
         print("⚠ Invalid choice, using default (parallel)")
         use_parallel = True
@@ -336,15 +369,19 @@ def scrape_new_series():
 
 def single_or_batch_add():
     """Add single series by URL or batch from file with auto-detect"""
+    default_file = os.path.join(os.path.dirname(__file__), 'series_urls.txt')
     print("\n→ Add single link / batch from file")
     print("  • Paste URL → scrapes single series")
-    print("  • Enter filename → uses that file for batch\n")
+    print("  • Enter filename → uses that file for batch")
+    print(f"  • Press Enter → uses default (series_urls.txt)")
+    print("  • Type 0   → back to main menu\n")
     
-    user_input = input("Enter: ").strip()
+    user_input = input(f"Enter [default: series_urls.txt]: ").strip()
     
-    if not user_input:
-        print("✗ No input provided")
+    if user_input == '0':
         return
+    if not user_input:
+        user_input = default_file
     
     if user_input.startswith(('http://', 'https://')):
         # Single URL
@@ -431,8 +468,11 @@ def batch_add_from_file(file_path):
         # Ask user for scraping mode
         print("\nScraping mode:")
         print("  1. Sequential (slower, but most reliable)")
-        print("  2. Parallel (faster, uses multiple workers)\n")
-        mode_choice = input("Choose mode (1-2) [default: 1]: ").strip() or '1'
+        print("  2. Parallel (faster, uses multiple workers)")
+        print("  0. Back\n")
+        mode_choice = input("Choose mode (0-2) [default: 1]: ").strip() or '1'
+        if mode_choice == '0':
+            return
         use_parallel = mode_choice == '2'
     else:
         use_parallel = None  # Let checkpoint decide
@@ -495,9 +535,13 @@ def generate_report():
     """Generate series report with optional filtering by subscription status"""
     print("\n→ Generate report")
     print("  1. Full report (all series)")
-    print("  2. Subscription/watchlist filtered report\n")
+    print("  2. Subscription/watchlist filtered report")
+    print("  0. Back\n")
     
-    choice = input("Choose report type (1-2): ").strip()
+    choice = input("Choose report type (0-2): ").strip()
+    
+    if choice == '0':
+        return
     
     try:
         index_manager = IndexManager(SERIES_INDEX_FILE)
@@ -538,9 +582,13 @@ def generate_report():
             print("\n→ Subscription/watchlist report")
             print("  1. Only subscribed")
             print("  2. Only watchlist")
-            print("  3. Both\n")
+            print("  3. Both")
+            print("  0. Back\n")
             
-            sub_choice = input("Choose filter (1-3): ").strip()
+            sub_choice = input("Choose filter (0-3): ").strip()
+            
+            if sub_choice == '0':
+                return
             
             if sub_choice == '1':
                 print("\n→ Generating report for subscribed series...")
@@ -561,8 +609,8 @@ def generate_report():
                 print("⚠ Invalid choice")
                 return
             
-            # Save report
-            report_file = os.path.join(DATA_DIR, 'series_report.json')
+            # Save to separate file per filter (does not overwrite the full report)
+            report_file = os.path.join(DATA_DIR, f'series_report_{filter_name}.json')
             with open(report_file, 'w', encoding='utf-8') as f:
                 json.dump(report, f, indent=2, ensure_ascii=False)
             
@@ -600,9 +648,13 @@ def scrape_subscribed_watchlist():
     print("\n→ Scrape subscribed/watchlist series")
     print("  1. Only subscribed")
     print("  2. Only watchlist")
-    print("  3. Both\n")
+    print("  3. Both")
+    print("  0. Back\n")
     
-    sub_choice = input("Choose source (1-3) [default: 3]: ").strip() or '3'
+    sub_choice = input("Choose source (0-3) [default: 3]: ").strip() or '3'
+    
+    if sub_choice == '0':
+        return
     
     if sub_choice == '1':
         source = 'subscribed'
