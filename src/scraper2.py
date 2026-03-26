@@ -172,7 +172,7 @@ if sys.platform == 'win32':
     signal.signal(signal.SIGBREAK, _signal_handler)
 
 # Performance settings - Allow overriding via environment variable
-MAX_WORKERS = 20
+MAX_WORKERS = 24
 
 
 # Pre-compiled regex for season label detection
