@@ -3239,6 +3239,9 @@ class SToBackupScraper:
         finally:
             # Final cleanup before exit
             self._cleanup_memory()
+            # Reconstitute any data that was flushed to disk during memory cleanup
+            # so callers can still access self.series_data after run() returns
+            self.series_data = self._load_flushed_series_data()
             self._series_retry_count.clear()  # Clear retry tracking
             self.clear_worker_pids()
             self.close()
