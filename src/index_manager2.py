@@ -493,6 +493,7 @@ class IndexManager:
                     for title, series in self.series_index.items():
                         if _validate_series_entry(series, title):
                             validated_index[title] = series
+                    self.series_index = validated_index
                     # Check that loaded data is not empty
                     if not self.series_index:
                         logger.warning("Loaded index is empty or contains no valid series")

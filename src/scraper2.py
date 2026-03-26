@@ -3041,7 +3041,7 @@ class SToBackupScraper:
                 'total_seasons': len(series_info['seasons']),
                 'total_episodes': total_eps,
                 'watched_episodes': watched_eps,
-                    'unwatched_episodes': total_eps - watched_eps,
+                'unwatched_episodes': total_eps - watched_eps,
                 'empty': total_eps == 0,
                 'seasons': series_info['seasons'],
             }

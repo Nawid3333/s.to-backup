@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 # Add the project root directory to Python path
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
-from config.config2 import EMAIL, PASSWORD, DATA_DIR, SERIES_INDEX_FILE, SERIES_INDEX_S_TO_FILE, LOG_FILE
+from config.config2 import EMAIL, PASSWORD, DATA_DIR, SERIES_INDEX_FILE, LOG_FILE
 from src.index_manager2 import IndexManager, confirm_and_save_changes
 from src.scraper2 import SToBackupScraper, MAX_WORKERS
 
@@ -243,7 +243,7 @@ def _run_scrape_and_save(run_kwargs, description, success_msg, no_data_msg):
     """
     try:
         scraper = SToBackupScraper()
-        scraper.run(output_file=SERIES_INDEX_S_TO_FILE, **run_kwargs)
+        scraper.run(output_file=SERIES_INDEX_FILE, **run_kwargs)
 
         if scraper.series_data:
             index_manager = IndexManager(SERIES_INDEX_FILE)
@@ -616,7 +616,7 @@ def scrape_subscribed_watchlist():
     
     print(f"\n  (Browser will open - do not close it manually)\n")
     
-    output_file = SERIES_INDEX_S_TO_FILE
+    output_file = SERIES_INDEX_FILE
     chk = _check_checkpoint(source)
     if not chk['ok']:
         print("\u2717 Cancelled")
