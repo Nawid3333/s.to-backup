@@ -57,6 +57,12 @@ def load_selectors_config():
 
 SELECTORS_CONFIG = load_selectors_config()
 
+# ==================== DISPLAY SETTINGS ====================
+# When False (default), change confirmations show a compact preview (first 5 items + count).
+# Press 'v' at any confirmation prompt to view the full list.
+# Set to True to always show the full list (old behavior).
+VERBOSE_CHANGES = False
+
 # ==================== SCRAPING SETTINGS ====================
 # Run in headless mode (no visible browser window)
 # Set to False to see browser automation for debugging

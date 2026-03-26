@@ -14,6 +14,11 @@ import time
 from collections import defaultdict
 from datetime import datetime
 
+try:
+    from config.config2 import VERBOSE_CHANGES
+except ImportError:
+    VERBOSE_CHANGES = False
+
 logger = logging.getLogger(__name__)
 
 # Pre-compiled regex for season number extraction
@@ -244,6 +249,47 @@ def paginate_list(items, formatter, page_size=50):
                 break
 
 
+def print_collapsed_list(items, formatter, preview_count=5):
+    """Show a compact preview: first N items + '...and X more'."""
+    if not items:
+        return
+    for item in items[:preview_count]:
+        print(formatter(item))
+    remaining = len(items) - preview_count
+    if remaining > 0:
+        print(f"  ... and {remaining} more")
+
+
+def _prompt_with_view(prompt_text, items, formatter, show_full_fn=None):
+    """Prompt y/n/v — 'v' shows all items then re-prompts y/n.
+    
+    Args:
+        prompt_text: The y/n question text (without the '(y/n/v)' suffix)
+        items: List of items for the 'v' expansion
+        formatter: Formatter function for each item
+        show_full_fn: Optional callable to display full list (overrides default loop).
+                      If None, uses paginate_list(items, formatter).
+    Returns:
+        True if user answered 'y', False otherwise.
+    """
+    while True:
+        resp = input(f"{prompt_text} (y/n/v): ").strip().lower()
+        if resp == 'v':
+            print()
+            if show_full_fn:
+                show_full_fn()
+            else:
+                paginate_list(items, formatter)
+            print("-"*70)
+            # After viewing, ask y/n only
+            resp = input(f"{prompt_text} (y/n): ").strip().lower()
+            return resp == 'y'
+        elif resp in ('y', 'n'):
+            return resp == 'y'
+        else:
+            print("  Please enter y, n, or v (view all).")
+
+
 def format_season_ep(season_label, ep_num):
     """Format season/episode for display.
     Regular seasons -> S1E5, Special seasons -> [Specials] Ep 3
@@ -376,8 +422,18 @@ def detect_changes(old_data, new_data):
 
 def show_changes(changes, include_unwatched=True, include_watched=True,
                  include_subscribe=True, include_unsubscribe=True,
-                 include_watchlist_add=True, include_watchlist_remove=True, new_data=None):
-    """Display changes with pagination and smart season grouping."""
+                 include_watchlist_add=True, include_watchlist_remove=True, new_data=None,
+                 verbose=None):
+    """Display changes with pagination and smart season grouping.
+    
+    When verbose is False, shows collapsed previews instead of paginated lists.
+    Defaults to VERBOSE_CHANGES config setting when verbose is None.
+    """
+    if verbose is None:
+        verbose = VERBOSE_CHANGES
+
+    _display = paginate_list if verbose else print_collapsed_list
+
     total = 0
     for k, v in changes.items():
         if k == 'newly_unwatched' and not include_unwatched:
@@ -415,65 +471,65 @@ def show_changes(changes, include_unwatched=True, include_watched=True,
             sub = '✓' if series.get('subscribed') else '✗'
             wl = '✓' if series.get('watchlist') else '✗'
             return f"  + {title}{season_info}: {watched}/{total} watched (Sub:{sub} WL:{wl})"
-        paginate_list(changes["new_series"], format_new_series)
+        _display(changes["new_series"], format_new_series)
 
     if changes["new_episodes"]:
         if new_data:
             grouped_lines = group_episodes_by_season(changes["new_episodes"], new_data)
             print(f"\n[NEW EPISODES] ({len(changes['new_episodes'])})")
-            paginate_list(grouped_lines, lambda line: line)
+            _display(grouped_lines, lambda line: line)
         else:
             print(f"\n[NEW EPISODES] ({len(changes['new_episodes'])})")
-            paginate_list(changes["new_episodes"], lambda x: f"  + {x[0]} [{x[1]}] Ep {x[2]}")
+            _display(changes["new_episodes"], lambda x: f"  + {x[0]} [{x[1]}] Ep {x[2]}")
 
     if changes["newly_watched"] and include_watched:
         print(f"\n[NEWLY WATCHED] ({len(changes['newly_watched'])} episodes)")
         watched_lines = group_episodes_by_season(changes["newly_watched"], new_data)
-        paginate_list(watched_lines, lambda line: line)
+        _display(watched_lines, lambda line: line)
 
     if changes.get("newly_unwatched") and include_unwatched:
         print(f"\n[SITE REPORTS UNWATCHED] ({len(changes['newly_unwatched'])} episodes)")
         unwatched_lines = group_episodes_by_season(changes["newly_unwatched"], new_data, prefix='[!]')
-        paginate_list(unwatched_lines, lambda line: line)
+        _display(unwatched_lines, lambda line: line)
 
     if changes.get("newly_subscribed") and include_subscribe:
         print(f"\n[NEWLY SUBSCRIBED] ({len(changes['newly_subscribed'])} series)")
-        paginate_list(
+        _display(
             changes["newly_subscribed"],
             lambda x: f"  [+] {x}"
         )
 
     if changes.get("newly_unsubscribed") and include_unsubscribe:
         print(f"\n[NEWLY UNSUBSCRIBED] ({len(changes['newly_unsubscribed'])} series)")
-        paginate_list(
+        _display(
             changes["newly_unsubscribed"],
             lambda x: f"  [-] {x}"
         )
 
     if changes.get("watchlist_added") and include_watchlist_add:
         print(f"\n[ADDED TO WATCHLIST] ({len(changes['watchlist_added'])} series)")
-        paginate_list(
+        _display(
             changes["watchlist_added"],
             lambda x: f"  [+] {x}"
         )
 
     if changes.get("watchlist_removed") and include_watchlist_remove:
         print(f"\n[REMOVED FROM WATCHLIST] ({len(changes['watchlist_removed'])} series)")
-        paginate_list(
+        _display(
             changes["watchlist_removed"],
             lambda x: f"  [-] {x}"
         )
 
     if changes.get("title_ger_changed"):
         print(f"\n[GERMAN TITLE CHANGED] ({len(changes['title_ger_changed'])} series)")
-        paginate_list(
+        _display(
             changes["title_ger_changed"],
             lambda x: f"  [~] {x[0]}: '{x[1]}' → '{x[2]}'"
         )
 
     if changes.get("title_eng_changed"):
         print(f"\n[ENGLISH TITLE CHANGED] ({len(changes['title_eng_changed'])} series)")
-        paginate_list(
+        _display(
             changes["title_eng_changed"],
             lambda x: f"  [~] {x[0]}: '{x[1]}' → '{x[2]}'"
         )
@@ -768,10 +824,13 @@ class IndexManager:
 def _prompt_change_confirmations(changes, new_dict):
     """
     Prompt the user to confirm each category of detected changes.
+    When VERBOSE_CHANGES is False, shows a compact preview with 'v' to expand.
 
     Returns:
         dict mapping change category to bool (allowed or not).
     """
+    verbose = VERBOSE_CHANGES
+
     allowed = {
         'watched': False,
         'unwatched': False,
@@ -783,14 +842,12 @@ def _prompt_change_confirmations(changes, new_dict):
         'title_eng': False,
     }
 
-    # Confirm watched (unwatched -> watched)
-    if changes['newly_watched']:
-        print(f"\n[OK] {len(changes['newly_watched'])} episode(s) would change from UNWATCHED to WATCHED")
-        print("   (manual confirmation required)")
-        print("\n" + "-"*70)
+    def _build_episode_lines(episode_list, new_dict, prefix='[+]'):
+        """Build formatted grouped-episode lines from a list of (title, season, ep_num)."""
         grouped = defaultdict(list)
-        for title, season, ep_num in changes['newly_watched']:
+        for title, season, ep_num in episode_list:
             grouped[(title, season)].append(ep_num)
+        lines = []
         for (title, season), ep_nums in grouped.items():
             series = new_dict.get(title)
             total_in_season, watched_in_season = _get_season_stats(series, season)
@@ -798,12 +855,37 @@ def _prompt_change_confirmations(changes, new_dict):
             wl = '✓' if series and series.get('watchlist') else '✗'
             sub_wl = f" (Sub:{sub} WL:{wl})"
             if total_in_season > 0:
-                print(f"  [+] {title} [{season}]: {watched_in_season}/{total_in_season} episodes{sub_wl}")
+                lines.append(f"  {prefix} {title} [{season}]: {watched_in_season}/{total_in_season} episodes{sub_wl}")
             else:
-                print(f"  [+] {title} [{season}]: {len(ep_nums)} episode(s){sub_wl}")
-        print("-"*70)
-        resp = input("\nAllow these episodes to be marked as WATCHED? (y/n): ").strip().lower()
-        if resp == 'y':
+                lines.append(f"  {prefix} {title} [{season}]: {len(ep_nums)} episode(s){sub_wl}")
+        return lines
+
+    def _show_and_confirm(header, items, formatter, prompt_text, show_full_fn=None):
+        """Display items (collapsed or full) and prompt the user.
+        Returns True if user confirmed, False otherwise.
+        """
+        print(f"\n{header}")
+        print("   (manual confirmation required)")
+        print("\n" + "-"*70)
+        if verbose:
+            for item in items:
+                print(formatter(item))
+            print("-"*70)
+            resp = input(f"\n{prompt_text} (y/n): ").strip().lower()
+            return resp == 'y'
+        else:
+            print_collapsed_list(items, formatter)
+            print("-"*70)
+            return _prompt_with_view(f"\n{prompt_text}", items, formatter, show_full_fn)
+
+    # Confirm watched (unwatched -> watched)
+    if changes['newly_watched']:
+        lines = _build_episode_lines(changes['newly_watched'], new_dict, prefix='[+]')
+        if _show_and_confirm(
+            f"[OK] {len(changes['newly_watched'])} episode(s) would change from UNWATCHED to WATCHED",
+            lines, lambda x: x,
+            "Allow these episodes to be marked as WATCHED?"
+        ):
             allowed['watched'] = True
             logger.info("User allowed watched changes.")
         else:
@@ -812,25 +894,12 @@ def _prompt_change_confirmations(changes, new_dict):
 
     # Confirm unwatched (watched -> unwatched)
     if changes['newly_unwatched']:
-        print(f"\n[WARN] {len(changes['newly_unwatched'])} episode(s) would change from WATCHED to UNWATCHED")
-        print("   (manual confirmation required)")
-        print("\n" + "-"*70)
-        grouped = defaultdict(list)
-        for title, season, ep_num in changes['newly_unwatched']:
-            grouped[(title, season)].append(ep_num)
-        for (title, season), ep_nums in grouped.items():
-            series = new_dict.get(title)
-            total_in_season, watched_in_season = _get_season_stats(series, season)
-            sub = '✓' if series and series.get('subscribed') else '✗'
-            wl = '✓' if series and series.get('watchlist') else '✗'
-            sub_wl = f" (Sub:{sub} WL:{wl})"
-            if total_in_season > 0:
-                print(f"  [!] {title} [{season}]: {watched_in_season}/{total_in_season} episodes{sub_wl}")
-            else:
-                print(f"  [!] {title} [{season}]: {len(ep_nums)} episode(s){sub_wl}")
-        print("-"*70)
-        resp = input("\nAllow these episodes to be marked as UNWATCHED? (y/n): ").strip().lower()
-        if resp == 'y':
+        lines = _build_episode_lines(changes['newly_unwatched'], new_dict, prefix='[!]')
+        if _show_and_confirm(
+            f"[WARN] {len(changes['newly_unwatched'])} episode(s) would change from WATCHED to UNWATCHED",
+            lines, lambda x: x,
+            "Allow these episodes to be marked as UNWATCHED?"
+        ):
             allowed['unwatched'] = True
             logger.info("User allowed unwatched changes.")
         else:
@@ -839,14 +908,11 @@ def _prompt_change_confirmations(changes, new_dict):
 
     # Confirm newly subscribed
     if changes['newly_subscribed']:
-        print(f"\n[+] {len(changes['newly_subscribed'])} series newly SUBSCRIBED")
-        print("   (manual confirmation required)")
-        print("\n" + "-"*70)
-        for title in changes['newly_subscribed']:
-            print(f"  [+] {title}")
-        print("-"*70)
-        resp = input("\nAllow these series to be marked as SUBSCRIBED? (y/n): ").strip().lower()
-        if resp == 'y':
+        if _show_and_confirm(
+            f"[+] {len(changes['newly_subscribed'])} series newly SUBSCRIBED",
+            changes['newly_subscribed'], lambda x: f"  [+] {x}",
+            "Allow these series to be marked as SUBSCRIBED?"
+        ):
             allowed['subscribe'] = True
             logger.info("User allowed subscribe changes.")
         else:
@@ -855,14 +921,11 @@ def _prompt_change_confirmations(changes, new_dict):
 
     # Confirm newly unsubscribed
     if changes['newly_unsubscribed']:
-        print(f"\n[-] {len(changes['newly_unsubscribed'])} series UNSUBSCRIBED")
-        print("   (manual confirmation required)")
-        print("\n" + "-"*70)
-        for title in changes['newly_unsubscribed']:
-            print(f"  [-] {title}")
-        print("-"*70)
-        resp = input("\nAllow these series to be marked as UNSUBSCRIBED? (y/n): ").strip().lower()
-        if resp == 'y':
+        if _show_and_confirm(
+            f"[-] {len(changes['newly_unsubscribed'])} series UNSUBSCRIBED",
+            changes['newly_unsubscribed'], lambda x: f"  [-] {x}",
+            "Allow these series to be marked as UNSUBSCRIBED?"
+        ):
             allowed['unsubscribe'] = True
             logger.info("User allowed unsubscribe changes.")
         else:
@@ -871,14 +934,11 @@ def _prompt_change_confirmations(changes, new_dict):
 
     # Confirm added to watchlist
     if changes['watchlist_added']:
-        print(f"\n[+] {len(changes['watchlist_added'])} series ADDED TO WATCHLIST")
-        print("   (manual confirmation required)")
-        print("\n" + "-"*70)
-        for title in changes['watchlist_added']:
-            print(f"  [+] {title}")
-        print("-"*70)
-        resp = input("\nAllow these series to be added to WATCHLIST? (y/n): ").strip().lower()
-        if resp == 'y':
+        if _show_and_confirm(
+            f"[+] {len(changes['watchlist_added'])} series ADDED TO WATCHLIST",
+            changes['watchlist_added'], lambda x: f"  [+] {x}",
+            "Allow these series to be added to WATCHLIST?"
+        ):
             allowed['watchlist_add'] = True
             logger.info("User allowed watchlist add changes.")
         else:
@@ -887,14 +947,11 @@ def _prompt_change_confirmations(changes, new_dict):
 
     # Confirm removed from watchlist
     if changes['watchlist_removed']:
-        print(f"\n[-] {len(changes['watchlist_removed'])} series REMOVED FROM WATCHLIST")
-        print("   (manual confirmation required)")
-        print("\n" + "-"*70)
-        for title in changes['watchlist_removed']:
-            print(f"  [-] {title}")
-        print("-"*70)
-        resp = input("\nAllow these series to be removed from WATCHLIST? (y/n): ").strip().lower()
-        if resp == 'y':
+        if _show_and_confirm(
+            f"[-] {len(changes['watchlist_removed'])} series REMOVED FROM WATCHLIST",
+            changes['watchlist_removed'], lambda x: f"  [-] {x}",
+            "Allow these series to be removed from WATCHLIST?"
+        ):
             allowed['watchlist_remove'] = True
             logger.info("User allowed watchlist remove changes.")
         else:
@@ -903,16 +960,13 @@ def _prompt_change_confirmations(changes, new_dict):
 
     # Confirm title_ger changes
     if changes['title_ger_changed']:
-        print(f"\n[~] {len(changes['title_ger_changed'])} German title(s) changed")
-        print("   (manual confirmation required)")
-        print("\n" + "-"*70)
-        for title, old_val, new_val in changes['title_ger_changed']:
-            print(f"  [~] {title}")
-            print(f"      Old: {old_val}")
-            print(f"      New: {new_val}")
-        print("-"*70)
-        resp = input("\nAllow German title changes? (y/n): ").strip().lower()
-        if resp == 'y':
+        def _fmt_title_change(x):
+            return f"  [~] {x[0]}\n      Old: {x[1]}\n      New: {x[2]}"
+        if _show_and_confirm(
+            f"[~] {len(changes['title_ger_changed'])} German title(s) changed",
+            changes['title_ger_changed'], _fmt_title_change,
+            "Allow German title changes?"
+        ):
             allowed['title_ger'] = True
             logger.info("User allowed German title changes.")
         else:
@@ -921,16 +975,13 @@ def _prompt_change_confirmations(changes, new_dict):
 
     # Confirm title_eng changes
     if changes['title_eng_changed']:
-        print(f"\n[~] {len(changes['title_eng_changed'])} English title(s) changed")
-        print("   (manual confirmation required)")
-        print("\n" + "-"*70)
-        for title, old_val, new_val in changes['title_eng_changed']:
-            print(f"  [~] {title}")
-            print(f"      Old: {old_val}")
-            print(f"      New: {new_val}")
-        print("-"*70)
-        resp = input("\nAllow English title changes? (y/n): ").strip().lower()
-        if resp == 'y':
+        def _fmt_title_change(x):
+            return f"  [~] {x[0]}\n      Old: {x[1]}\n      New: {x[2]}"
+        if _show_and_confirm(
+            f"[~] {len(changes['title_eng_changed'])} English title(s) changed",
+            changes['title_eng_changed'], _fmt_title_change,
+            "Allow English title changes?"
+        ):
             allowed['title_eng'] = True
             logger.info("User allowed English title changes.")
         else:
