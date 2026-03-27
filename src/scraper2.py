@@ -451,7 +451,14 @@ class SToBackupScraper:
             series_watched += season_data.get('watched_episodes', 0)
             series_total_eps += season_data.get('total_episodes', 0)
 
-        if not series_had_error and series_slug in series_data and series_total_eps > 0:
+        # Only mark as completed if ALL data is reliable:
+        # - No missing seasons
+        # - At least 1 episode found
+        # - Subscription AND watchlist status successfully determined
+        # Without this, a series with None sub/wl ends up in completed_links
+        # and gets skipped on checkpoint resume, silently disappearing from output.
+        sub_wl_ok = is_subscribed is not None and is_watchlist is not None
+        if not series_had_error and sub_wl_ok and series_slug in series_data and series_total_eps > 0:
             self.completed_links.add(series_slug)
 
         return series_watched, series_total_eps, series_had_error, is_subscribed, is_watchlist
@@ -1766,6 +1773,19 @@ class SToBackupScraper:
                 self._wait_for_page_ready(drv)
                 self.inject_popup_killer(drv)
                 
+                # Wait for subscription action buttons to be present in the DOM
+                # before reading page source — they may load slightly after
+                # document.readyState == 'complete' on slow connections.
+                if not skip_subscription:
+                    try:
+                        sub_sel = self.get_selector('subscription') or {}
+                        btn_css = sub_sel.get('action_button', '.js-action-btn')
+                        WebDriverWait(drv, self.get_timing_float('element_find_timeout', 2.0)).until(
+                            EC.presence_of_element_located((By.CSS_SELECTOR, btn_css))
+                        )
+                    except Exception:
+                        logger.debug(f"Subscription buttons not found within timeout for {series_url}")
+                
                 page_source = drv.page_source
                 
                 # Detect browser error pages (about:neterror, about:certerror, DNS failures, etc.)
@@ -1792,6 +1812,18 @@ class SToBackupScraper:
                     return None
                 
                 soup = BeautifulSoup(page_source, 'html.parser')
+                
+                # Verify page was served in a logged-in state.
+                # This protects ALL user-specific data (watched status, sub/wl)
+                # even when skip_subscription=True. Without this, a silently
+                # expired session would produce a page where all episodes
+                # appear unwatched and subscription buttons are inactive.
+                if not soup.select_one('form[action="/logout"]'):
+                    # Don't retry within this method — session expiry won't
+                    # fix itself. Return None so the caller can re-authenticate
+                    # and reschedule this season.
+                    logger.warning(f"Session expired (no logout form on page): {series_url}")
+                    return None
                 
                 # Extract season number from URL
                 if '/staffel-' in series_url:
@@ -1930,6 +1962,16 @@ class SToBackupScraper:
         try:
             subscribed = None
             watchlist = None
+            
+            # Verify the page is showing a logged-in view by checking for the
+            # logout form. If absent, the session has expired and button states
+            # reflect the anonymous (inactive) defaults — not the user's actual
+            # subscription status. Return (None, None) so the caller knows the
+            # data is unreliable and can trigger re-authentication.
+            logout_form = soup.select_one('form[action="/logout"]')
+            if not logout_form:
+                logger.warning("No logout form on page — session likely expired, subscription status unreliable")
+                return (None, None)
             
             # Look for subscription buttons (prefer desktop-only container to avoid
             # scanning duplicate mobile buttons)
@@ -2359,10 +2401,12 @@ class SToBackupScraper:
                     logger.error(f"{series_slug}: Driver died before season {season} — skipping remaining seasons")
                     break
 
-                if not self._has_auth_cookies(drv):
-                    if not self.is_logged_in(drv):
-                        logger.warning(f"{series_slug}: Session expired before season {season} — re-authenticating")
-                        self._authenticate_driver(drv, label=f"season-{season}", max_attempts=2)
+                # Check auth: cookies missing OR server invalidated the session.
+                # _has_auth_cookies only checks browser-side cookie presence,
+                # which stays True even when the server expired the session.
+                if not self._has_auth_cookies(drv) or not self.is_logged_in(drv):
+                    logger.warning(f"{series_slug}: Session expired before season {season} — re-authenticating")
+                    self._authenticate_driver(drv, label=f"season-{season}", max_attempts=2)
 
                 data = self.scrape_series_detail(season_url, drv, max_retries=max_retries,
                                                  skip_subscription=_sub_confirmed)
@@ -2371,13 +2415,33 @@ class SToBackupScraper:
                     if data.get('title'):
                         title = data['title']
                     if not _sub_confirmed:
-                        _sub_readings.append((data.get('subscribed'), data.get('watchlist')))
+                        sub_val, wl_val = data.get('subscribed'), data.get('watchlist')
+                        # If both are None, session may have expired — verify
+                        # and re-authenticate before continuing to avoid a
+                        # cascade of silently wrong subscription readings.
+                        if sub_val is None and wl_val is None:
+                            if not self.is_logged_in(drv):
+                                logger.warning(f"{series_slug}: Session expired during season {season} — re-authenticating")
+                                self._authenticate_driver(drv, label=f"sub-recovery-s{season}", max_attempts=2)
+                                # Re-scrape this season with fresh auth
+                                retry_data = self.scrape_series_detail(season_url, drv, max_retries=2)
+                                if retry_data is not None:
+                                    season_results[-1] = retry_data
+                                    sub_val = retry_data.get('subscribed')
+                                    wl_val = retry_data.get('watchlist')
+                        _sub_readings.append((sub_val, wl_val))
                         if len(_sub_readings) >= 2 and _sub_readings[-1] == _sub_readings[-2]:
                             _sub_confirmed = True
                     consecutive_failures = 0
                 else:
                     consecutive_failures += 1
                     logger.warning(f"{series_slug}: Season {season} returned no data (fail #{consecutive_failures})")
+                    # If scrape returned None, session may have expired.
+                    # Check immediately and re-auth so remaining seasons
+                    # get correct data (don't wait for next season's pre-check).
+                    if not self.is_logged_in(drv):
+                        logger.warning(f"{series_slug}: Session expired after season {season} failure — re-authenticating")
+                        self._authenticate_driver(drv, label=f"season-{season}-recovery", max_attempts=2)
                     if consecutive_failures >= 2:
                         backoff_step = self.get_timing_float('season_failure_backoff_step', 0.5)
                         backoff_max = self.get_timing_float('season_failure_backoff_max', 2.0)
@@ -2415,6 +2479,11 @@ class SToBackupScraper:
             retry_max = int(val) if val is not None else 5
             for attempt in range(retry_max):
                 try:
+                    # Verify auth before each retry — session expiry may have
+                    # caused the original failure in the first pass.
+                    if not self.is_logged_in(drv):
+                        logger.warning(f"{series_slug}: Session expired during retry of season {season} — re-authenticating")
+                        self._authenticate_driver(drv, label=f"retry-s{season}", max_attempts=2)
                     data = self.scrape_series_detail(season_url, drv, max_retries=2)
                     if data is not None:
                         season_results.append(data)
@@ -2700,6 +2769,12 @@ class SToBackupScraper:
                     # Check if subscription/watchlist status could not be determined
                     sub_wl_missing = is_sub is None or is_wl is None
                     if sub_wl_missing:
+                        # Session may have expired — check and re-auth NOW so
+                        # subsequent series don't silently fail the same way.
+                        if not self.is_logged_in(driver):
+                            logger.warning(f"W{worker_id}: Session expired (detected via missing Sub/WL for {series_slug}) — re-authenticating")
+                            self._authenticate_driver(driver, label=f"W{worker_id}", max_attempts=2)
+                            error_streak = 0
                         logger.warning(f"W{worker_id}: {series_slug} missing Sub/WL status (Sub={is_sub}, WL={is_wl}) — marking as failed for retry")
                     
                     with self._lock:
@@ -2986,6 +3061,11 @@ class SToBackupScraper:
                 # Check if subscription/watchlist status could not be determined
                 sub_wl_missing = is_sub is None or is_wl is None
                 if sub_wl_missing:
+                    # Session may have expired — check and re-auth NOW so
+                    # subsequent series don't silently produce wrong data.
+                    if not self.is_logged_in(self.driver):
+                        logger.warning(f"{series_slug}: Session expired (detected via missing Sub/WL) — re-authenticating")
+                        self._authenticate_driver(self.driver, label="seq-sub-recovery", max_attempts=2)
                     logger.warning(f"{series_slug} missing Sub/WL status (Sub={is_sub}, WL={is_wl}) — marking as failed for retry")
                     if not any(
                         (isinstance(f, dict) and f.get('url', '').endswith(series_slug)) or f == series_slug
@@ -3110,11 +3190,15 @@ class SToBackupScraper:
             )
             
             # Build ordered dict: metadata first, then seasons
+            # subscribed/watchlist MUST be boolean at this point — the None
+            # check above guarantees it. Use direct access (not .get with
+            # a False default) so a bug that lets None slip through crashes
+            # loudly instead of silently writing wrong data.
             ordered = {
                 'url': series_info.get('url', ''),
                 'link': series_info.get('link', ''),
-                'subscribed': series_info.get('subscribed', False),
-                'watchlist': series_info.get('watchlist', False),
+                'subscribed': series_info['subscribed'],
+                'watchlist': series_info['watchlist'],
                 'title': series_info.get('title', series_slug),
                 'alt_titles': series_info.get('alt_titles', []),
                 'total_seasons': len(series_info['seasons']),
