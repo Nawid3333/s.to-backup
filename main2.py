@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 from config.config2 import EMAIL, PASSWORD, DATA_DIR, SERIES_INDEX_FILE, LOG_FILE
-from src.index_manager2 import IndexManager, confirm_and_save_changes, show_vanished_series, _extract_slug_from_field
+from src.index_manager2 import IndexManager, confirm_and_save_changes, show_vanished_series, _extract_slug_from_field, get_episode_counts
 from src.scraper2 import SToBackupScraper, MAX_WORKERS
 
 # Pre-compiled regex for URL validation
@@ -119,49 +119,10 @@ def print_header():
     print("="*60 + "\n")
 
 
-def print_scraped_series_status():
-    """Reload index and print status for all newly scraped/updated series"""
-    try:
-        index_manager = IndexManager(SERIES_INDEX_FILE)
-
-        if not index_manager.series_index:
-            return
-
-        series_list = list(index_manager.series_index.values())
-        if not series_list:
-            return
-
-        # Sort by last updated (most recent first)
-        sorted_series = sorted(
-            series_list,
-            key=lambda s: s.get('last_updated', s.get('added_date', '')),
-            reverse=True
-        )
-
-        # Show first 5 updated series
-        display_count = min(5, len(sorted_series))
-        if display_count > 0:
-            print("\n" + "-"*70)
-            print("EPISODE STATUS (from merged index):")
-            print("-"*70)
-            for s in sorted_series[:display_count]:
-                watched = s.get('watched_episodes', 0)
-                total = s.get('total_episodes', 0)
-                percent = round((watched / total * 100), 1) if total else 0
-                season_labels = [str(sn.get('season', '?')) for sn in s.get('seasons', [])]
-                season_info = f" [{','.join(season_labels)}]" if season_labels else ""
-                sub = "✓" if s.get('subscribed') else "✗"
-                wl = "✓" if s.get('watchlist') else "✗"
-                print(f"  • {s.get('title')}{season_info}: {watched}/{total} episodes ({percent}%) | Sub: {sub} | WL: {wl}")
-    except Exception as e:
-        logger.error(f"Error printing series status: {e}")
-
-
 def print_completed_series_alerts(index_manager=None):
     """Alert user about series that need attention:
     1. Fully watched but not subscribed
     2. Ongoing (started but incomplete) but not on watchlist
-    3. Not started (0 watched) but subscribed or on watchlist
     """
     try:
         if index_manager is None:
@@ -170,20 +131,11 @@ def print_completed_series_alerts(index_manager=None):
         if not index_manager.series_index:
             return
 
-        # Rule 1: Fully watched + not subscribed + not on watchlist
         completed_not_sub = []
-        # Rule 2: Ongoing + not on watchlist
         ongoing_no_wl = []
-        # Rule 3: Not started but subscribed or on watchlist
-        not_started_sub_wl = []
 
         for s in index_manager.series_index.values():
-            # Recalculate from actual episode data to avoid stale top-level counts
-            total = sum(len(sn.get('episodes', [])) for sn in s.get('seasons', []))
-            watched = sum(
-                sum(1 for ep in sn.get('episodes', []) if ep.get('watched', False))
-                for sn in s.get('seasons', [])
-            )
+            total, watched = get_episode_counts(s)
             subscribed = s.get('subscribed', False)
             watchlist = s.get('watchlist', False)
 
@@ -191,22 +143,16 @@ def print_completed_series_alerts(index_manager=None):
                 completed_not_sub.append(s)
             elif total > 0 and 0 < watched < total and not watchlist:
                 ongoing_no_wl.append(s)
-            elif total > 0 and watched == 0 and (subscribed or watchlist):
-                not_started_sub_wl.append(s)
 
         # --- Alert 1: Fully watched + not subscribed + not on watchlist ---
         if completed_not_sub:
             completed_not_sub.sort(key=lambda s: s.get('title', ''))
             print("\n" + "⚠"*35)
-            print("⚠ COMPLETED SERIES — NOT SUBSCRIBED:")
+            print(f"⚠ {len(completed_not_sub)} COMPLETED SERIES — NOT SUBSCRIBED:")
             print("─" * 70)
             for s in completed_not_sub:
-                total = sum(len(sn.get('episodes', [])) for sn in s.get('seasons', []))
-                season_labels = [str(sn.get('season', '?')) for sn in s.get('seasons', [])]
-                season_info = f" [{','.join(season_labels)}]" if season_labels else ""
-                print(f"  • {s.get('title')}{season_info}: {total}/{total} episodes (100%) | Sub: ✗ | WL: ✗")
+                print(f"  • {s.get('title')}")
             print("─" * 70)
-            print(f"→ {len(completed_not_sub)} series fully watched but not subscribed.")
             print("  Consider subscribing or leaving as-is.")
             print("⚠" * 35)
 
@@ -230,40 +176,12 @@ def print_completed_series_alerts(index_manager=None):
         if ongoing_no_wl:
             ongoing_no_wl.sort(key=lambda s: s.get('title', ''))
             print("\n" + "⚠"*35)
-            print("⚠ ONGOING SERIES — NOT ON WATCHLIST:")
+            print(f"⚠ {len(ongoing_no_wl)} ONGOING SERIES — NOT ON WATCHLIST:")
             print("─" * 70)
             for s in ongoing_no_wl:
-                total = sum(len(sn.get('episodes', [])) for sn in s.get('seasons', []))
-                watched = sum(
-                    sum(1 for ep in sn.get('episodes', []) if ep.get('watched', False))
-                    for sn in s.get('seasons', [])
-                )
-                percent = round((watched / total * 100), 1) if total else 0
-                season_labels = [str(sn.get('season', '?')) for sn in s.get('seasons', [])]
-                season_info = f" [{','.join(season_labels)}]" if season_labels else ""
-                sub = "✓" if s.get('subscribed') else "✗"
-                print(f"  • {s.get('title')}{season_info}: {watched}/{total} episodes ({percent}%) | Sub: {sub} | WL: ✗")
+                print(f"  • {s.get('title')}")
             print("─" * 70)
-            print(f"→ {len(ongoing_no_wl)} ongoing series not on your watchlist.")
             print("  Consider adding them to your watchlist.")
-            print("⚠" * 35)
-
-        # --- Alert 3: Not started but subscribed or on watchlist ---
-        if not_started_sub_wl:
-            not_started_sub_wl.sort(key=lambda s: s.get('title', ''))
-            print("\n" + "⚠"*35)
-            print("⚠ NOT STARTED — BUT SUBSCRIBED/WATCHLIST:")
-            print("─" * 70)
-            for s in not_started_sub_wl:
-                total = sum(len(sn.get('episodes', [])) for sn in s.get('seasons', []))
-                season_labels = [str(sn.get('season', '?')) for sn in s.get('seasons', [])]
-                season_info = f" [{','.join(season_labels)}]" if season_labels else ""
-                sub = "✓" if s.get('subscribed') else "✗"
-                wl = "✓" if s.get('watchlist') else "✗"
-                print(f"  • {s.get('title')}{season_info}: 0/{total} episodes (0%) | Sub: {sub} | WL: {wl}")
-            print("─" * 70)
-            print(f"→ {len(not_started_sub_wl)} series not started but subscribed/on watchlist.")
-            print("  You may want to start watching or remove them.")
             print("⚠" * 35)
 
     except Exception as e:
@@ -336,8 +254,7 @@ def _run_scrape_and_save(run_kwargs, description, success_msg, no_data_msg):
             
             if confirm_and_save_changes(scraper.series_data, description, index_manager):
                 print(f"\n✓ {success_msg}")
-                print_scraped_series_status()
-                print_completed_series_alerts()
+                print_completed_series_alerts(index_manager)
                 logger.info(success_msg)
         else:
             print(f"\n⚠ {no_data_msg}")
@@ -521,25 +438,10 @@ def batch_add_from_file(file_path):
         return
     resume = chk['resume']
     
-    if not resume:
-        # Ask user for scraping mode
-        print("\nScraping mode:")
-        print("  1. Sequential (slower, but most reliable)")
-        print("  2. Parallel (faster, uses multiple workers)")
-        print("  0. Back\n")
-        mode_choice = input("Choose mode (0-2) [default: 1]: ").strip() or '1'
-        if mode_choice == '0':
-            return
-        use_parallel = mode_choice == '2'
-    else:
-        use_parallel = None  # Let checkpoint decide
-    
     print(f"\n→ Starting batch scraper for {len(urls)} series...")
     print("  (Browser will open - do not close it manually)\n")
     
-    run_kwargs = dict(url_list=urls, resume_only=resume)
-    if not resume:
-        run_kwargs['parallel'] = use_parallel
+    run_kwargs = dict(url_list=urls, resume_only=resume, parallel=True)
     
     _run_scrape_and_save(
         run_kwargs=run_kwargs,
@@ -600,10 +502,9 @@ def _print_report_summary(report, report_file, filter_name=None):
     print(header)
     print("-"*70)
     print(f"  Total series:        {stats['total_series']}")
-    print(f"  Watched (100%):      {stats['watched']} ({stats.get('watched_percentage', 0):.1f}%)")
-    print(f"  Unwatched:           {stats.get('unwatched', 0)}")
-    print(f"  Ongoing (started):   {ongoing_count}")
-    print(f"  Not started:         {not_started_count}")
+    print(f"  Completed (100%):    {stats.get('completed_count', stats['watched'])}")
+    print(f"  Ongoing (started):   {stats.get('ongoing_count', ongoing_count)}")
+    print(f"  Not started (0%):    {stats.get('not_started_count', not_started_count)}")
     if not_started_sub_wl_count > 0:
         print(f"  Not started (Sub/WL):{not_started_sub_wl_count}")
     print(f"  Total episodes:      {stats['total_episodes']}")
@@ -817,6 +718,8 @@ def scrape_subscribed_watchlist():
         
         injected_count_wl = 0
         injected_count_sub = 0
+        injected_names_wl = []
+        injected_names_sub = []
         
         for title, entry in disappeared_watchlist:
             slug = _extract_slug(entry)
@@ -832,6 +735,7 @@ def scrape_subscribed_watchlist():
                 scraper.series_data.append(stub)
             scraped_titles.add(title)
             injected_count_wl += 1
+            injected_names_wl.append(title)
         
         for title, entry in disappeared_subscribed:
             slug = _extract_slug(entry)
@@ -846,6 +750,8 @@ def scrape_subscribed_watchlist():
                         if item.get('title') == title:
                             item['subscribed'] = False
                             break
+                injected_count_sub += 1
+                injected_names_sub.append(title)
                 continue
             stub = copy.deepcopy(entry)
             stub['subscribed'] = False
@@ -855,11 +761,16 @@ def scrape_subscribed_watchlist():
                 scraper.series_data.append(stub)
             scraped_titles.add(title)
             injected_count_sub += 1
+            injected_names_sub.append(title)
         
         if injected_count_wl > 0:
-            print(f"  ⚠ {injected_count_wl} series no longer on watchlist (will prompt for confirmation)")
+            print(f"\n  ⚠ {injected_count_wl} series no longer on watchlist (will prompt for confirmation):")
+            for name in injected_names_wl:
+                print(f"    • {name}")
         if injected_count_sub > 0:
-            print(f"  ⚠ {injected_count_sub} series no longer subscribed (will prompt for confirmation)")
+            print(f"\n  ⚠ {injected_count_sub} series no longer subscribed (will prompt for confirmation):")
+            for name in injected_names_sub:
+                print(f"    • {name}")
         
         # Show vanished-series informational notification
         # Exclude series already handled by flag flipping above (they'll appear in change prompts)
@@ -871,8 +782,7 @@ def scrape_subscribed_watchlist():
             index_manager = IndexManager(SERIES_INDEX_FILE)
             if confirm_and_save_changes(scraper.series_data, "Account series", index_manager):
                 print("\n✓ Account series scraping completed!")
-                print_scraped_series_status()
-                print_completed_series_alerts()
+                print_completed_series_alerts(index_manager)
                 logger.info("Account series scraping completed")
         else:
             print("\n⚠ No data scraped")

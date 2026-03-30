@@ -21,7 +21,8 @@
         { "type": "css", "value": "input[type='submit']" },
         { "type": "css", "value": "button.btn-primary" },
         { "type": "css", "value": "button.btn" }
-      ]
+      ],
+      "logged_in_indicator": "form[action='/logout']"
     },
     "series_detail": {
       "episode_rows": ".episode-table tbody tr.episode-row",
@@ -30,7 +31,8 @@
       "title_eng": ".episode-title-eng",
       "watched_class": "seen",
       "series_title": "h1.fw-bold",
-      "description": ".series-description .description-text"
+      "description": ".series-description .description-text",
+      "episode_nav_pills": "#episode-nav a.alphabet-link"
     },
     "subscription": {
       "action_button": ".js-action-btn",

@@ -37,6 +37,7 @@ from config.config2 import (
     HTTP_REQUEST_TIMEOUT, PAGE_LOAD_TIMEOUT,
     DRIVER_QUIT_TIMEOUT, MAX_TOTAL_RETRIES
 )
+from src.index_manager2 import _is_pid_alive
 
 logger = logging.getLogger(__name__)
 
@@ -48,23 +49,6 @@ MAX_MODERATE_BACKOFF = 3.0
 MODERATE_BACKOFF_FACTOR = 0.3
 LIGHT_BACKOFF_THRESHOLD = 1.0
 BACKOFF_DECAY_STEP = 0.1
-
-
-def _is_pid_alive(pid):
-    """Check if a process with the given PID is still running."""
-    try:
-        if sys.platform == 'win32':
-            result = subprocess.run(
-                ['tasklist', '/FI', f'PID eq {pid}', '/NH'],
-                capture_output=True, check=False, text=True,
-                encoding='utf-8', errors='replace'
-            )
-            return str(pid) in result.stdout
-        else:
-            os.kill(pid, 0)
-            return True
-    except (OSError, ValueError):
-        return False
 
 
 def _kill_pids_in_file(pids_dict):
@@ -124,8 +108,8 @@ def cleanup_stale_worker_pids():
                 pass
 
 
-# Auto-clean stale PID files on startup (handles hard-killed terminals)
-cleanup_stale_worker_pids()
+# NOTE: cleanup_stale_worker_pids() is called once on first scraper
+# instantiation via SToBackupScraper.__init__(), not at import time.
 
 
 def cleanup_geckodriver_processes(timeout_sec=5):
@@ -170,7 +154,7 @@ if sys.platform == 'win32':
     signal.signal(signal.SIGBREAK, _signal_handler)
 
 # Performance settings - Allow overriding via environment variable
-MAX_WORKERS = 24
+MAX_WORKERS = int(os.getenv("STO_MAX_WORKERS", "24"))
 
 
 # Pre-compiled regex for season label detection
@@ -197,7 +181,12 @@ class ConfigurationError(Exception):
 # ==================== UTILITY FUNCTIONS ====================
 
 def validate_episode_data(episodes):
-    """Validate episode data for consistency. Fixes common data issues."""
+    """Validate episode data for consistency.
+    
+    Does NOT fabricate or substitute any data — only passes through
+    what was actually scraped. If a required field is missing, the
+    episode is dropped and a warning is logged.
+    """
     if not isinstance(episodes, list):
         logger.warning("Episode data is not a list")
         return []
@@ -205,19 +194,31 @@ def validate_episode_data(episodes):
     validated = []
     for i, ep in enumerate(episodes):
         if not isinstance(ep, dict):
-            logger.debug(f"Skipping invalid episode entry: {ep}")
+            logger.warning(f"Dropping non-dict episode entry at index {i}: {ep}")
             continue
         
-        # Ensure required fields exist
+        # Require episode number — never fabricate one
         ep_num = ep.get('number')
         if ep_num is None:
-            ep_num = i + 1  # Use index as fallback
+            logger.warning(f"Dropping episode at index {i}: missing episode number")
+            continue
+        
+        # Require 'watched' field — never assume unwatched
+        if 'watched' not in ep:
+            logger.warning(f"Dropping episode at index {i}: missing 'watched' field")
+            continue
         
         validated_ep = {
             'number': int(ep_num) if isinstance(ep_num, (int, float)) else ep_num,
-            'title': ep.get('title', f'Episode {ep_num}'),
-            'watched': bool(ep.get('watched', False))
+            'watched': ep['watched']
         }
+        # Pass through title fields exactly as scraped (may be empty string)
+        if 'title_ger' in ep:
+            validated_ep['title_ger'] = ep['title_ger']
+        if 'title_eng' in ep:
+            validated_ep['title_eng'] = ep['title_eng']
+        if 'title' in ep:
+            validated_ep['title'] = ep['title']
         validated.append(validated_ep)
     
     return validated
@@ -251,8 +252,14 @@ class SToBackupScraper:
     Scrapes series, seasons, episodes, watched status, and subscription info.
     Supports both parallel and sequential execution modes.
     """
+
+    _stale_pids_cleaned = False
     
     def __init__(self):
+        if not SToBackupScraper._stale_pids_cleaned:
+            cleanup_stale_worker_pids()
+            SToBackupScraper._stale_pids_cleaned = True
+
         self.driver = None
         self.config = SELECTORS_CONFIG
         self.email = EMAIL
@@ -268,6 +275,8 @@ class SToBackupScraper:
         self.pause_file = os.path.join(DATA_DIR, '.pause_scraping')
         self._checkpoint_mode = None  # Tracks which option created the checkpoint
         self._config_validated = False  # Track if selector config was validated
+        self._last_pause_check = 0.0
+        self._pause_cached = False
         
         # Retry tracking per series (prevents infinite retries)
         self._series_retry_count = {}  # key: series_slug, value: retry count
@@ -286,6 +295,8 @@ class SToBackupScraper:
         # Periodic flush: series_data is written to disk to prevent unbounded memory growth
         self._partial_data_file = os.path.join(DATA_DIR, '.series_data_partial.jsonl')
         self._flushed_count = 0  # Total entries flushed to disk so far
+        self.timing_file = os.path.join(DATA_DIR, '.scrape_timing.json')
+        self._historical_avg = None  # Loaded at scrape start from last run
         
         # Validate config on init
         self._validate_selectors_config()
@@ -352,6 +363,33 @@ class SToBackupScraper:
         
         self._config_validated = True
         logger.debug("Selector config validated successfully")
+
+    def _load_scrape_timing(self):
+        """Load avg time per series from last completed scrape."""
+        try:
+            with open(self.timing_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            avg = data.get('avg_per_series')
+            if avg and avg > 0:
+                return float(avg)
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
+        return None
+
+    def _save_scrape_timing(self, duration, series_count):
+        """Save timing data from completed scrape for future ETA estimates."""
+        if series_count <= 0:
+            return
+        data = {
+            'last_scrape_duration': round(duration, 2),
+            'series_count': series_count,
+            'avg_per_series': round(duration / series_count, 4),
+            'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S')
+        }
+        try:
+            self._atomic_write_json(self.timing_file, data)
+        except Exception as e:
+            logger.warning(f"Could not save scrape timing: {e}")
 
     def _add_failed_link(self, item, series_url=None, display_title=None, error=None):
         """Thread-safe helper to add a failed link entry with friendly error message."""
@@ -437,6 +475,7 @@ class SToBackupScraper:
         series_had_error = len(missing_seasons) > 0
         series_watched = 0
         series_total_eps = 0
+        total_malformed = 0
 
         for season_data in season_results:
             if series_slug not in series_data:
@@ -447,9 +486,17 @@ class SToBackupScraper:
                     'subscribed': is_subscribed,
                     'watchlist': is_watchlist,
                 }
+            # Track malformed episodes from this season
+            malformed = season_data.pop('_malformed_episodes', 0)
+            total_malformed += malformed
             series_data[series_slug]['seasons'].append(season_data)
             series_watched += season_data.get('watched_episodes', 0)
             series_total_eps += season_data.get('total_episodes', 0)
+
+        if total_malformed > 0:
+            series_had_error = True
+            series_data[series_slug]['_has_malformed_episodes'] = True
+            logger.warning(f"{series_slug}: {total_malformed} malformed episode row(s) across all seasons — marking for retry")
 
         # Only mark as completed if ALL data is reliable:
         # - No missing seasons
@@ -463,24 +510,33 @@ class SToBackupScraper:
 
         return series_watched, series_total_eps, series_had_error, is_subscribed, is_watchlist
 
-    @staticmethod
-    def _format_progress_line(done, total, start_time, title, watched=None,
+    def _format_progress_line(self, done, total, start_time, title, watched=None,
                               episode_total=None, empty=False, error=None,
                               worker_id=None, worker_count=None, season_labels=None,
                               subscribed=None, watchlist=None):
         """Build a single-line progress string with bar, ETA, and status.
         
         Used by both parallel and sequential scraping modes.
+        Uses historical avg from last scrape for better early ETA.
         """
         elapsed = time.time() - start_time
-        avg = elapsed / max(1, done)
+        current_avg = elapsed / max(1, done) if done > 0 else 0
+        historical_avg = self._historical_avg
+        # Blend with historical avg for better early ETA
+        if done <= 0 and historical_avg:
+            effective_avg = historical_avg
+        elif historical_avg is not None and total > 0:
+            blend = min(1.0, done / max(1, total * 0.15))
+            effective_avg = (1 - blend) * historical_avg + blend * current_avg
+        else:
+            effective_avg = current_avg
         remaining = total - done
-        eta_mins = int((avg * remaining) / 60)
+        eta_mins = int((effective_avg * remaining) / 60)
         pct = int((done / total) * 100) if total else 0
         bar_len = 30
         filled = int(bar_len * done / total) if total else 0
         bar = '█' * filled + '░' * (bar_len - filled)
-        worker_info = f" | W{worker_id}/{worker_count}" if worker_id and worker_count else ""
+        worker_info = f" | W{worker_id}/{worker_count}" if worker_id and worker_count else " | Fallback"
         season_info = f" [{','.join(str(s) for s in season_labels)}]" if season_labels else ""
         # Subscription status indicators
         sub_parts = []
@@ -735,11 +791,21 @@ class SToBackupScraper:
                     logger.debug(f"Could not remove failed series file: {e}")
     
     def is_pause_requested(self):
-        """Check if pause has been requested via pause file"""
-        return self.pause_file and os.path.exists(self.pause_file)
+        """Check if pause was requested (cached: re-checks file at most every 2 seconds)."""
+        try:
+            now = time.time()
+            if now - self._last_pause_check < 2.0:
+                return self._pause_cached
+            self._last_pause_check = now
+            self._pause_cached = self.pause_file and os.path.exists(self.pause_file)
+            return self._pause_cached
+        except OSError:
+            return False
     
     def clear_pause_request(self):
-        """Clear pause request file"""
+        """Clear pause request file."""
+        self._pause_cached = False
+        self._last_pause_check = 0.0
         if self.pause_file and os.path.exists(self.pause_file):
             try:
                 os.remove(self.pause_file)
@@ -1233,16 +1299,6 @@ class SToBackupScraper:
                 logger.warning(f"Error closing driver: {e}, forcing close")
             print("✓ Browser closed")
     
-    def _check_retry_limit(self, series_slug):
-        """Check if series has exceeded retry limit. Returns True if limit reached."""
-        with self._lock:
-            count = self._series_retry_count.get(series_slug, 0)
-            if count >= MAX_TOTAL_RETRIES:
-                logger.warning(f"{series_slug}: Exceeded max retries ({MAX_TOTAL_RETRIES}), giving up")
-                return True
-            self._series_retry_count[series_slug] = count + 1
-            return False
-    
     def _flush_series_data_to_disk(self):
         """Append current series_data to a JSONL file on disk and clear the in-memory list.
         
@@ -1318,22 +1374,26 @@ class SToBackupScraper:
         try:
             cookies = driver.get_cookies()
             cookie_names = {c['name'] for c in cookies}
-            # s.to uses a session cookie — check that at least one auth-related cookie exists
-            # Common session cookie names for PHP/Laravel sites
-            session_indicators = {'session', 'PHPSESSID', 'laravel_session', 'remember_web', 'XSRF-TOKEN'}
+            # s.to uses Laravel — check for Laravel session cookies
+            session_indicators = {'laravel_session', 'XSRF-TOKEN', 'remember_web'}
             if cookie_names & session_indicators:
                 return True
-            # Fallback: if we have any cookies on the s.to domain, session is likely alive
+            # Fallback: if we have 2+ cookies on the s.to domain, session is likely alive
             site_domain = urlparse(self.get_site_url()).hostname
             domain_cookies = [c for c in cookies if site_domain in (c.get('domain', '') or '')]
-            return len(domain_cookies) >= 2  # At least 2 domain cookies suggests active session
+            if len(domain_cookies) >= 2:
+                return True
+            logger.debug(f"_has_auth_cookies: no session indicators found. Cookies: {cookie_names}")
+            return False
         except Exception:
             return False
 
     def is_logged_in(self, driver):
-        """Check if authenticated by looking for the logout form in the page header."""
+        """Check if authenticated using configurable selector from login config."""
         try:
-            return len(driver.find_elements(By.CSS_SELECTOR, 'form[action="/logout"]')) > 0
+            login_config = self.get_selector('login') or {}
+            indicator = login_config.get('logged_in_indicator', "form[action='/logout']")
+            return len(driver.find_elements(By.CSS_SELECTOR, indicator)) > 0
         except Exception:
             return False
     
@@ -1703,6 +1763,11 @@ class SToBackupScraper:
             error_text = error_div.get_text(strip=True)
             if 'nicht gefunden' in error_text.lower():
                 return error_text
+        # If the page has series content (season nav pills), it's a real series
+        # page — not an error page. This prevents false positives for series
+        # named "Error 404", "Fehler 404", etc.
+        if soup.select_one('#season-nav a[data-season-pill]') or soup.select_one('a[href*="/staffel-"]'):
+            return None
         # Check for standalone 404 page by <title> – only match if the title
         # starts with "404" or contains "Error 404", not a series name.
         title_tag = soup.find('title')
@@ -1855,14 +1920,20 @@ class SToBackupScraper:
                 if not episode_rows:
                     logger.warning(f"No episode rows found for {series_url} using any selector")
                 
-                for row in episode_rows:
+                malformed_count = 0
+                for row_idx, row in enumerate(episode_rows, start=1):
                     try:
                         # Extract episode number
                         num_cell = row.select_one(sel.get('episode_number', 'th.episode-number-cell'))
                         episode_num = num_cell.get_text(strip=True) if num_cell else ''
-                        if not episode_num or not episode_num.isdigit():
-                            logger.warning(f"Skipping episode row with invalid episode number '{episode_num}' in {series_url}")
-                            continue
+                        if not episode_num:
+                            # Filme/movie pages may lack episode numbers — fall back
+                            # to data-episode-season-id (ordinal number within season),
+                            # then to 1-based row index.
+                            episode_num = row.get('data-episode-season-id', '')
+                        if not episode_num:
+                            episode_num = str(row_idx)
+                            logger.debug(f"Using row index {row_idx} as episode number for {series_url}")
                         
                         # Extract both German and English titles
                         ger_cell = row.select_one(sel.get('title_ger', '.episode-title-ger'))
@@ -1880,8 +1951,9 @@ class SToBackupScraper:
                             'watched': is_watched
                         })
                     except Exception as e:
-                        logger.warning(f"Error parsing episode row in {series_url}: {e}")
-                        print(f"    ⚠ Error parsing episode row: {str(e)[:50]}")
+                        malformed_count += 1
+                        logger.warning(f"Malformed episode row {row_idx} in {series_url}: {e}")
+                        print(f"    ⚠ Malformed episode row {row_idx}: {str(e)[:50]}")
                         continue
                 
                 # Detect subscription status and title from this page
@@ -1907,14 +1979,32 @@ class SToBackupScraper:
                 
                 logger.debug(f"Scraped {series_url}: {len(episodes)} episodes ({watched_count} watched), title={series_title}")
                 if len(episodes) == 0:
-                    logger.warning(f"0 episodes found for {series_url} — page may not have loaded correctly")
+                    # 0 episodes means the page didn't load correctly or
+                    # selectors are wrong — return None to trigger retry
+                    # instead of accepting empty data as valid.
+                    logger.warning(f"0 episodes found for {series_url} — treating as failed (page may not have loaded correctly)")
+                    return None
+                
+                # Cross-validate: compare episode count from nav pills vs table rows.
+                # The episode nav (#episode-nav) lists every episode as a pill link.
+                # If those counts differ, the table parse is incomplete.
+                ep_nav_selector = sel.get('episode_nav_pills', '#episode-nav a.alphabet-link')
+                episode_nav_pills = soup.select(ep_nav_selector)
+                expected_episode_count = len(episode_nav_pills)
+                if expected_episode_count > 0 and len(episodes) != expected_episode_count:
+                    logger.warning(
+                        f"Episode count mismatch for {series_url}: "
+                        f"nav pills={expected_episode_count}, table rows={len(episodes)} — "
+                        f"treating as incomplete (page may not have fully loaded)"
+                    )
+                    return None
                 
                 # Validate episode data before returning
                 validated_episodes = validate_episode_data(episodes)
                 watched_count = sum(1 for ep in validated_episodes if ep['watched'])
                 
                 self._decay_global_backoff()
-                return {
+                result = {
                     'season': season,
                     'url': series_url,
                     'episodes': validated_episodes,
@@ -1925,6 +2015,9 @@ class SToBackupScraper:
                     'title': series_title,
                     'alt_titles': alt_titles
                 }
+                if malformed_count > 0:
+                    result['_malformed_episodes'] = malformed_count
+                return result
                 
             except Exception as e:
                 error_msg = str(e)
@@ -2038,10 +2131,11 @@ class SToBackupScraper:
                 if idx + 1 < len(parts):
                     return parts[idx + 1]
             
-            return 'unknown'
+            logger.error(f"Could not extract slug from URL: {url}")
+            raise ValueError(f"URL does not contain '/serie/{{slug}}': {url}")
         except Exception as e:
-            print(f"    ⚠ Error extracting slug: {str(e)[:50]}")
-            return 'unknown'
+            logger.error(f"Error extracting slug from URL '{url}': {e}")
+            raise ValueError(f"Invalid series URL: {url}")
 
     def _extract_seasons_from_soup(self, soup, series_slug):
         """
@@ -2275,6 +2369,78 @@ class SToBackupScraper:
                     pass
             raise Exception(f"Failed to create worker driver: {str(e)}")
     
+    def _restart_worker_driver(self, worker_id, old_driver):
+        """Restart a worker's browser and re-authenticate.
+
+        Args:
+            worker_id: Worker number for logging.
+            old_driver: The crashed/stale driver to quit.
+
+        Returns:
+            tuple: (new_driver, success) — new_driver is None on failure.
+        """
+        try:
+            old_driver.quit()
+        except Exception:
+            pass
+        try:
+            driver = self._create_worker_driver(worker_id)
+            self.inject_aggressive_adblock(driver)
+            if not self._authenticate_driver(driver, label=f"W{worker_id}", max_attempts=2):
+                logger.error(f"W{worker_id}: Re-auth failed after driver restart")
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                return None, False
+            logger.info(f"W{worker_id}: Driver restarted and re-authenticated")
+            return driver, True
+        except Exception as e:
+            logger.error(f"W{worker_id}: Failed to restart driver: {e}", exc_info=True)
+            return None, False
+
+    def _worker_health_check(self, worker_id, driver, error_streak):
+        """Perform a health check on a worker driver and re-authenticate if needed.
+
+        Args:
+            worker_id: Worker number for logging.
+            driver: The worker's WebDriver.
+            error_streak: Current consecutive error count.
+
+        Returns:
+            tuple: (error_streak, driver_alive) — driver_alive is False if driver is dead.
+        """
+        if not self._is_driver_alive(driver):
+            return error_streak, False
+        if error_streak >= 3:
+            logger.debug(f"W{worker_id}: Full health check (error streak={error_streak})")
+            try:
+                if not self.is_logged_in(driver):
+                    logger.warning(f"W{worker_id}: Session expired, re-authenticating...")
+                    if self._authenticate_driver(driver, label=f"W{worker_id}", max_attempts=2):
+                        error_streak = 0
+                        logger.info(f"W{worker_id}: Re-authentication successful")
+                    else:
+                        error_streak += 1
+            except Exception as e:
+                logger.error(f"W{worker_id}: Health check failed: {e}", exc_info=True)
+                error_streak += 1
+        else:
+            logger.debug(f"W{worker_id}: Lightweight health check")
+            if not self._has_auth_cookies(driver):
+                logger.warning(f"W{worker_id}: Cookies missing, verifying with full check...")
+                try:
+                    if not self.is_logged_in(driver):
+                        if self._authenticate_driver(driver, label=f"W{worker_id}", max_attempts=2):
+                            error_streak = 0
+                            logger.info(f"W{worker_id}: Re-authentication successful")
+                        else:
+                            error_streak += 1
+                except Exception as e:
+                    logger.error(f"W{worker_id}: Health check failed: {e}", exc_info=True)
+                    error_streak += 1
+        return error_streak, True
+
     def save_worker_pid(self, worker_id, pid):
         """Save worker geckodriver PID for cleanup (atomic write)."""
         with self._lock:
@@ -2343,7 +2509,8 @@ class SToBackupScraper:
 
     def _apply_cookies_to_driver(self, driver):
         """Apply auth cookies from main driver to a worker driver (thread-safe snapshot)."""
-        cookies_snapshot = list(self.auth_cookies)
+        with self._lock:
+            cookies_snapshot = list(self.auth_cookies)
         if not cookies_snapshot:
             return False
         try:
@@ -2368,14 +2535,16 @@ class SToBackupScraper:
         except Exception:
             return False
     
-    def _finish_scrape(self, start_time, failed_count):
-        """Save failed series and print timing summary."""
+    def _finish_scrape(self, start_time, failed_count, series_count=0):
+        """Save failed series, save timing data, and print timing summary."""
         if self.failed_links:
             self.save_failed_series()
             print(f"\n\u26a0 {len(self.failed_links)} series failed. Saved for retry.")
         total_time = time.time() - start_time
         total_mins = int(total_time / 60)
         total_secs = int(total_time % 60)
+        if series_count > 0:
+            self._save_scrape_timing(total_time, series_count)
         if failed_count:
             print(f"\n\u2713 Completed in {total_mins}m {total_secs}s ({failed_count} failed)")
         else:
@@ -2474,10 +2643,17 @@ class SToBackupScraper:
             return title
 
         for season in sorted(missing):
+            if not self._is_driver_alive(drv):
+                logger.error(f"{series_slug}: Driver died during retry pass, aborting remaining seasons")
+                break
+
             season_url = f"https://s.to/serie/{series_slug}/staffel-{season}"
             val = self.get_timing('max_retries_retry', default=None)
             retry_max = int(val) if val is not None else 5
             for attempt in range(retry_max):
+                if not self._is_driver_alive(drv):
+                    logger.error(f"{series_slug}: Driver died during retry for season {season}")
+                    break
                 try:
                     # Verify auth before each retry — session expiry may have
                     # caused the original failure in the first pass.
@@ -2595,13 +2771,15 @@ class SToBackupScraper:
         
         series_data = {}
         total_series = len(series_urls)
+        self._historical_avg = self._load_scrape_timing()
         start_time = time.time()
         completed = 0
         failed = 0
         stop_event = threading.Event()
         
         # Shared work queue — all workers pull from the same pool
-        worker_count = min(max_workers, total_series) or 1
+        # Scale workers: ~1 per 15 series, minimum 1, capped at max_workers
+        worker_count = min(max_workers, max(1, total_series // 15))
         work_queue = queue.Queue()
         for item in series_urls:
             work_queue.put(item)
@@ -2666,26 +2844,13 @@ class SToBackupScraper:
                     if not self._is_driver_alive(driver):
                         logger.warning(f"W{worker_id}: Driver dead before processing {series_slug} — restarting immediately")
                         print(f"  ⚠ W{worker_id}: Browser crashed — restarting...")
-                        try:
-                            driver.quit()
-                        except Exception:
-                            pass
-                        try:
-                            driver = self._create_worker_driver(worker_id)
-                            self.inject_aggressive_adblock(driver)
-                            if not self._authenticate_driver(driver, label=f"W{worker_id}", max_attempts=2):
-                                logger.error(f"W{worker_id}: Re-auth failed after driver restart — giving up")
-                                print(f"  ✗ W{worker_id}: Re-auth failed after restart. Items remain in queue.")
-                                work_queue.put(item)  # Put item back for other workers
-                                break
-                            error_streak = 0
-                            logger.info(f"W{worker_id}: Driver restarted and re-authenticated")
-                            print(f"  ✓ W{worker_id}: Browser restarted successfully")
-                        except Exception as e:
-                            logger.error(f"W{worker_id}: Failed to restart driver: {e}", exc_info=True)
-                            print(f"  ✗ W{worker_id}: Failed to restart browser — giving up")
-                            work_queue.put(item)  # Put item back for other workers
+                        driver, ok = self._restart_worker_driver(worker_id, driver)
+                        if not ok:
+                            print(f"  ✗ W{worker_id}: Re-auth failed after restart. Items remain in queue.")
+                            work_queue.put(item)
                             break
+                        print(f"  ✓ W{worker_id}: Browser restarted successfully")
+                        error_streak = 0
 
                     # Inline season detection with this worker's driver
                     # On failure, mark series as failed instead of silently defaulting to season 1
@@ -2696,23 +2861,12 @@ class SToBackupScraper:
                         if not self._is_driver_alive(driver):
                             logger.warning(f"W{worker_id}: Driver died during season detection for {series_slug} — restarting and re-queuing")
                             print(f"  ⚠ W{worker_id}: Browser crashed during {series_slug} — restarting...")
-                            work_queue.put(item)  # Re-queue item for retry
-                            try:
-                                driver.quit()
-                            except Exception:
-                                pass
-                            try:
-                                driver = self._create_worker_driver(worker_id)
-                                self.inject_aggressive_adblock(driver)
-                                if not self._authenticate_driver(driver, label=f"W{worker_id}", max_attempts=2):
-                                    logger.error(f"W{worker_id}: Re-auth failed after driver restart")
-                                    break
-                                error_streak = 0
-                                logger.info(f"W{worker_id}: Driver restarted and re-authenticated")
-                                print(f"  ✓ W{worker_id}: Browser restarted — {series_slug} re-queued")
-                            except Exception as restart_err:
-                                logger.error(f"W{worker_id}: Failed to restart driver: {restart_err}", exc_info=True)
+                            work_queue.put(item)
+                            driver, ok = self._restart_worker_driver(worker_id, driver)
+                            if not ok:
                                 break
+                            print(f"  ✓ W{worker_id}: Browser restarted — {series_slug} re-queued")
+                            error_streak = 0
                             continue
                         logger.error(f"W{worker_id}: Season detection failed for {series_slug}: {e}", exc_info=True)
                         print(f"  ✗ W{worker_id}: Season detection failed for {series_slug}: {str(e)[:80]}")
@@ -2736,23 +2890,12 @@ class SToBackupScraper:
                     if missing_seasons and not self._is_driver_alive(driver):
                         logger.warning(f"W{worker_id}: Driver died mid-scrape for {series_slug} — restarting and re-queuing")
                         print(f"  ⚠ W{worker_id}: Browser crashed during {series_slug} — restarting...")
-                        work_queue.put(item)  # Re-queue for full retry
-                        try:
-                            driver.quit()
-                        except Exception:
-                            pass
-                        try:
-                            driver = self._create_worker_driver(worker_id)
-                            self.inject_aggressive_adblock(driver)
-                            if not self._authenticate_driver(driver, label=f"W{worker_id}", max_attempts=2):
-                                logger.error(f"W{worker_id}: Re-auth failed after driver restart")
-                                break
-                            error_streak = 0
-                            logger.info(f"W{worker_id}: Driver restarted and re-authenticated")
-                            print(f"  ✓ W{worker_id}: Browser restarted — {series_slug} re-queued")
-                        except Exception as restart_err:
-                            logger.error(f"W{worker_id}: Failed to restart driver: {restart_err}", exc_info=True)
+                        work_queue.put(item)
+                        driver, ok = self._restart_worker_driver(worker_id, driver)
+                        if not ok:
                             break
+                        print(f"  ✓ W{worker_id}: Browser restarted — {series_slug} re-queued")
+                        error_streak = 0
                         continue
                     
                     # Aggregate results
@@ -2762,7 +2905,12 @@ class SToBackupScraper:
                             is_subscribed=result_sub, is_watchlist=result_wl)
                     
                     if series_had_error:
-                        logger.warning(f"W{worker_id}: {series_slug} missing seasons {missing_seasons} — NOT marking as completed")
+                        error_reasons = []
+                        if missing_seasons:
+                            error_reasons.append(f"missing seasons {missing_seasons}")
+                        if series_data.get(series_slug, {}).get('_has_malformed_episodes'):
+                            error_reasons.append("malformed episode rows")
+                        logger.warning(f"W{worker_id}: {series_slug} {' + '.join(error_reasons) or 'unknown error'} — NOT marking as completed")
                     elif series_total_eps == 0 and not series_had_error:
                         logger.warning(f"W{worker_id}: {series_slug} returned 0 episodes across {len(seasons)} season(s) — marking as failed for retry")
                     
@@ -2781,6 +2929,7 @@ class SToBackupScraper:
                         completed += 1
                         if series_slug not in series_data:
                             failed += 1
+                            self.failed_links.append(self._normalize_failed_item(item, series_url, display_title))
                             print(self._format_progress_line(completed, total_series, start_time, series_title, error='failed', worker_id=worker_id, worker_count=worker_count))
                         elif sub_wl_missing:
                             failed += 1
@@ -2796,9 +2945,14 @@ class SToBackupScraper:
                         elif series_had_error:
                             failed += 1
                             self.failed_links.append(self._normalize_failed_item(item, series_url, display_title))
-                            scraped_seasons = [r['season'] for r in season_results]
+                            error_parts = []
+                            if missing_seasons:
+                                scraped_seasons = [r['season'] for r in season_results]
+                                error_parts.append(f"missing seasons {missing_seasons} (got {scraped_seasons})")
+                            if series_data.get(series_slug, {}).get('_has_malformed_episodes'):
+                                error_parts.append("malformed episode rows")
                             print(self._format_progress_line(completed, total_series, start_time, series_title,
-                                          error=f"missing seasons {missing_seasons} (got {scraped_seasons})",
+                                          error=' + '.join(error_parts) or 'data error',
                                           worker_id=worker_id, worker_count=worker_count))
                         elif series_total_eps == 0:
                             failed += 1
@@ -2819,23 +2973,12 @@ class SToBackupScraper:
                     if not self._is_driver_alive(driver):
                         logger.warning(f"W{worker_id}: Driver died during {series_slug} — restarting and re-queuing")
                         print(f"  ⚠ W{worker_id}: Browser crashed during {series_slug} — restarting...")
-                        work_queue.put(item)  # Re-queue item for retry
-                        try:
-                            driver.quit()
-                        except Exception:
-                            pass
-                        try:
-                            driver = self._create_worker_driver(worker_id)
-                            self.inject_aggressive_adblock(driver)
-                            if not self._authenticate_driver(driver, label=f"W{worker_id}", max_attempts=2):
-                                logger.error(f"W{worker_id}: Re-auth failed after driver restart")
-                                break
-                            error_streak = 0
-                            logger.info(f"W{worker_id}: Driver restarted and re-authenticated")
-                            print(f"  ✓ W{worker_id}: Browser restarted — {series_slug} re-queued")
-                        except Exception as restart_err:
-                            logger.error(f"W{worker_id}: Failed to restart driver: {restart_err}", exc_info=True)
+                        work_queue.put(item)
+                        driver, ok = self._restart_worker_driver(worker_id, driver)
+                        if not ok:
                             break
+                        print(f"  ✓ W{worker_id}: Browser restarted — {series_slug} re-queued")
+                        error_streak = 0
                         continue
                     logger.error(f"W{worker_id}: Unhandled error for {series_slug}: {e}", exc_info=True)
                     with self._lock:
@@ -2859,49 +3002,17 @@ class SToBackupScraper:
                 do_health_check = (tasks_since_check >= health_every) or (error_streak >= 3)
                 if do_health_check:
                     tasks_since_check = 0
-                    
-                    if error_streak >= 3:
-                        # Error streak: do full page-navigation check
-                        logger.debug(f"W{worker_id}: Full health check (error streak={error_streak})")
-                        try:
-                            if not self.is_logged_in(driver):
-                                logger.warning(f"W{worker_id}: Session expired, re-authenticating...")
-                                if self._authenticate_driver(driver, label=f"W{worker_id}", max_attempts=2):
-                                    error_streak = 0
-                                    logger.info(f"W{worker_id}: Re-authentication successful")
-                                else:
-                                    error_streak += 1
-                        except Exception as e:
-                            logger.error(f"W{worker_id}: Health check failed: {e}", exc_info=True)
-                            error_streak += 1
-                    else:
-                        # Routine check: lightweight cookie check (no page loads)
-                        logger.debug(f"W{worker_id}: Lightweight health check (tasks_since={tasks_since_check})")
-                        if not self._has_auth_cookies(driver):
-                            logger.warning(f"W{worker_id}: Cookies missing, verifying with full check...")
-                            try:
-                                if not self.is_logged_in(driver):
-                                    if self._authenticate_driver(driver, label=f"W{worker_id}", max_attempts=2):
-                                        error_streak = 0
-                                        logger.info(f"W{worker_id}: Re-authentication successful")
-                                    else:
-                                        error_streak += 1
-                            except Exception as e:
-                                logger.error(f"W{worker_id}: Health check failed: {e}", exc_info=True)
-                                error_streak += 1
+                    error_streak, alive = self._worker_health_check(worker_id, driver, error_streak)
+                    if not alive:
+                        break
                 
                 # Restart driver after too many consecutive errors
                 if error_streak >= restart_threshold:
                     logger.warning(f"W{worker_id}: Error streak {error_streak} >= threshold {restart_threshold}, restarting driver")
-                    try:
-                        driver.quit()
-                    except Exception:
-                        pass
-                    driver = self._create_worker_driver(worker_id)
-                    self.inject_aggressive_adblock(driver)
-                    self._authenticate_driver(driver, label=f"W{worker_id}", max_attempts=2)
+                    driver, ok = self._restart_worker_driver(worker_id, driver)
+                    if not ok:
+                        break
                     error_streak = 0
-                    logger.info(f"W{worker_id}: Driver restarted and re-authenticated")
             
             # Cleanup worker driver
             try:
@@ -2936,7 +3047,7 @@ class SToBackupScraper:
             if _ctrl_c:
                 # Finalize data so run()'s BaseException handler saves it in checkpoint
                 self.series_data = self._finalize_series_data(series_data)
-                self._finish_scrape(start_time, failed)
+                self._finish_scrape(start_time, failed, total_series)
                 print(f"\n⚠ Ctrl+C — saving {len(series_data)}/{total_series} scraped series...")
         
         # Drain any remaining items from queue (e.g. all workers died)
@@ -2953,7 +3064,7 @@ class SToBackupScraper:
             logger.warning(f"{orphaned} series left unprocessed in queue — marked as failed for retry")
             print(f"  ⚠ {orphaned} series were not picked up by any worker — saved for retry")
         
-        self._finish_scrape(start_time, failed)
+        self._finish_scrape(start_time, failed, total_series)
         
         # Check if pause was requested — raise to trigger checkpoint save in run()
         if self.is_pause_requested():
@@ -2980,6 +3091,7 @@ class SToBackupScraper:
         """
         series_data = {}
         total_series = len(series_urls)
+        self._historical_avg = self._load_scrape_timing()
         start_time = time.time()
         failed = 0
         consecutive_series_failures = 0
@@ -3090,12 +3202,18 @@ class SToBackupScraper:
                 elif series_had_error:
                     failed += 1
                     consecutive_series_failures += 1
-                    scraped_seasons = [r['season'] for r in season_results]
-                    logger.error(f"Series incomplete: {series_slug} — got {scraped_seasons}, missing {missing_seasons}")
-                    print(self._format_progress_line(idx, total_series, start_time, series_title, error=f"{scraped_count}/{expected_count} seasons (missing: {','.join(missing_seasons)})"))
+                    error_parts = []
+                    if missing_seasons:
+                        scraped_seasons = [r['season'] for r in season_results]
+                        error_parts.append(f"got {scraped_seasons}, missing {missing_seasons}")
+                    if series_data.get(series_slug, {}).get('_has_malformed_episodes'):
+                        error_parts.append("malformed episode rows")
+                    logger.error(f"Series incomplete: {series_slug} — {' + '.join(error_parts) or 'data error'}")
+                    print(self._format_progress_line(idx, total_series, start_time, series_title, error=' + '.join(error_parts) or 'data error'))
                 elif series_slug not in series_data:
                     failed += 1
                     consecutive_series_failures += 1
+                    self.failed_links.append(self._normalize_failed_item(item, series_url, display_title))
                     logger.error(f"Series failed: {series_slug}")
                     print(self._format_progress_line(idx, total_series, start_time, series_title, error='Failed'))
                 elif series_total_eps == 0:
@@ -3115,12 +3233,12 @@ class SToBackupScraper:
         
         except (KeyboardInterrupt, SystemExit):
             # Finalize data before propagating to run() which saves full checkpoint
-            self._finish_scrape(start_time, failed)
+            self._finish_scrape(start_time, failed, total_series)
             self.series_data = self._finalize_series_data(series_data)
             print(f"\n⚠ Ctrl+C — saving {len(series_data)}/{total_series} scraped series...")
             raise
         
-        self._finish_scrape(start_time, failed)
+        self._finish_scrape(start_time, failed, total_series)
         
         # Check if pause was requested — raise to trigger checkpoint save in run()
         if self.is_pause_requested():
@@ -3291,7 +3409,10 @@ class SToBackupScraper:
             print("✓ No new series detected — skipping scraper spin-up")
             return
 
-        raw = self._scrape_series_sequential(new_series)
+        if self._use_parallel and len(new_series) > 1:
+            raw = self._scrape_series_parallel(new_series, MAX_WORKERS)
+        else:
+            raw = self._scrape_series_sequential(new_series)
         self.series_data = self._finalize_series_data(raw)
 
     def scrape_single_series(self, url):
@@ -3308,7 +3429,11 @@ class SToBackupScraper:
         series_list = []
         for url in urls:
             main_url = self.normalize_to_series_url(url)
-            slug = self.get_series_slug_from_url(main_url)
+            try:
+                slug = self.get_series_slug_from_url(main_url)
+            except ValueError as e:
+                print(f"    ⚠ Skipping invalid URL: {main_url} ({e})")
+                continue
             series_list.append({
                 'title': slug,
                 'link': f"/serie/{slug}",

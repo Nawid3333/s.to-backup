@@ -4,11 +4,14 @@ Manages the persistent series index and handles data merging, change detection, 
 Ported from Save bs.to with s.to-specific extensions (subscription/watchlist tracking).
 """
 
+import copy
 import json
 import logging
 import os
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 import time
 from collections import defaultdict
@@ -20,6 +23,24 @@ except ImportError:
     VERBOSE_CHANGES = False
 
 logger = logging.getLogger(__name__)
+
+
+def _is_pid_alive(pid):
+    """Check if a process with the given PID is still running (cross-platform)."""
+    try:
+        if sys.platform == 'win32':
+            result = subprocess.run(
+                ['tasklist', '/FI', f'PID eq {pid}', '/NH'],
+                capture_output=True, check=False, text=True,
+                encoding='utf-8', errors='replace'
+            )
+            return str(pid) in result.stdout
+        else:
+            os.kill(pid, 0)
+            return True
+    except (OSError, ValueError):
+        return False
+
 
 # Pre-compiled regex for season number extraction
 _SEASON_NUMBER_RE = re.compile(r'(staffel|season|s)\s*(\d+)', re.IGNORECASE)
@@ -73,6 +94,9 @@ class FileLock:
         
         # Timeout expired — check if the lock is stale (owner process died)
         if self._is_lock_stale():
+            # Race note: another process could grab the lock between remove()
+            # and the O_CREAT|O_EXCL retry below. This is acceptable because the
+            # retry uses atomic exclusive creation — it will simply fail gracefully.
             logger.warning(f"Removing stale lock on {self.filepath} (owner process dead)")
             try:
                 os.remove(self.lock_file)
@@ -97,14 +121,8 @@ class FileLock:
             with open(self.lock_file, 'r') as f:
                 pid_str = f.read().strip()
             pid = int(pid_str)
-            # Check if the process is still alive
-            try:
-                os.kill(pid, 0)
-                return False  # Process is still alive — lock is valid
-            except OSError:
-                return True  # Process is dead — lock is stale
+            return not _is_pid_alive(pid)
         except (OSError, ValueError):
-            # Can't read or parse pid — treat as stale to unblock
             return True
     
     def release(self):
@@ -206,8 +224,8 @@ def _validate_series_entry(series, title=''):
             continue
         episodes = season.get('episodes')
         if episodes is not None and not isinstance(episodes, list):
-            logger.warning(f"Series '{title}' season '{season.get('season', '?')}' has invalid episodes type")
-            season['episodes'] = []
+            logger.error(f"Rejecting series '{title}' — season '{season.get('season', '?')}' has CORRUPT episodes (type={type(episodes).__name__}, expected list)")
+            return False
     return True
 
 
@@ -229,6 +247,17 @@ def _get_season_stats(series, season_label):
             eps = s.get('episodes', [])
             return len(eps), sum(1 for ep in eps if ep.get('watched', False))
     return 0, 0
+
+
+def get_episode_counts(series):
+    """Get (total_episodes, watched_episodes) across all seasons of a series."""
+    total = 0
+    watched = 0
+    for season in series.get('seasons', []):
+        eps = season.get('episodes', [])
+        total += len(eps)
+        watched += sum(1 for ep in eps if ep.get('watched', False))
+    return total, watched
 
 
 def paginate_list(items, formatter, page_size=50):
@@ -320,15 +349,12 @@ def group_episodes_by_season(episode_list, new_data, prefix='[+]'):
     result = []
     for (title, season), ep_nums in sorted(grouped.items()):
         series = new_data_dict.get(title, {})
-        total_in_season, watched_in_season = _get_season_stats(series, season)
-        sub = '✓' if series.get('subscribed') else '✗'
-        wl = '✓' if series.get('watchlist') else '✗'
-        sub_wl = f" (Sub:{sub} WL:{wl})"
+        total_in_season, _ = _get_season_stats(series, season)
         if total_in_season > 0:
-            result.append(f"  {prefix} {title} [{season}]: {watched_in_season}/{total_in_season} episodes{sub_wl}")
+            result.append(f"  {prefix} {title} [{season}]: {len(ep_nums)}/{total_in_season} episodes")
         else:
             for ep_num in sorted(ep_nums):
-                result.append(f"  {prefix} {title} {format_season_ep(season, ep_num)}{sub_wl}")
+                result.append(f"  {prefix} {title} {format_season_ep(season, ep_num)}")
     return result
 
 
@@ -400,13 +426,13 @@ def detect_changes(old_data, new_data):
         for season in old_series.get('seasons', []):
             s_label = season.get('season', '')
             for ep in season.get('episodes', []):
-                old_eps[(s_label, ep.get('number'))] = ep.get('watched', False)
+                old_eps[(s_label, str(ep.get('number')))] = ep.get('watched', False)
         
         for season in new_series.get('seasons', []):
             s_label = season.get('season', '')
             for ep in season.get('episodes', []):
                 ep_num = ep.get('number')
-                ep_key = (s_label, ep_num)
+                ep_key = (s_label, str(ep_num))
                 new_watched = ep.get('watched', False)
                 
                 if ep_key not in old_eps:
@@ -464,13 +490,10 @@ def show_changes(changes, include_unwatched=True, include_watched=True,
             series = _find_series(new_data, title)
             if not series:
                 return f"  + {title}"
-            watched = series.get('watched_episodes', 0)
             total = series.get('total_episodes', 0)
             season_labels = [str(sn.get('season', '?')) for sn in series.get('seasons', [])]
             season_info = f" [{','.join(season_labels)}]" if season_labels else ""
-            sub = '✓' if series.get('subscribed') else '✗'
-            wl = '✓' if series.get('watchlist') else '✗'
-            return f"  + {title}{season_info}: {watched}/{total} watched (Sub:{sub} WL:{wl})"
+            return f"  + {title}{season_info}: {total} episodes"
         _display(changes["new_series"], format_new_series)
 
     if changes["new_episodes"]:
@@ -611,12 +634,7 @@ class IndexManager:
         """Get series with computed episode progress information"""
         series_list = []
         for s in self.series_index.values():
-            total_eps = 0
-            watched_eps = 0
-            for season in s.get('seasons', []):
-                eps = season.get('episodes', [])
-                total_eps += len(eps)
-                watched_eps += sum(1 for ep in eps if ep.get('watched', False))
+            total_eps, watched_eps = get_episode_counts(s)
             is_incomplete = (total_eps == 0) or (watched_eps < total_eps)
             completion = round((watched_eps / total_eps) * 100, 2) if total_eps > 0 else 0.0
             series_list.append({
@@ -670,10 +688,16 @@ class IndexManager:
             '100%': sum(1 for p in completion_percentages if p == 100)
         }
         
-        # Top/bottom performers
-        sorted_by_completion = sorted(series_with_progress, key=lambda x: x['completion'], reverse=True)
-        most_completed = sorted_by_completion[:5]
-        least_completed = [s for s in sorted_by_completion[-5:] if s['completion'] < 100][:5]
+        # Only consider ongoing series (started but not 100%) for most/least completed
+        ongoing_only = [s for s in series_with_progress if 0 < s['completion'] < 100]
+        sorted_ongoing = sorted(ongoing_only, key=lambda x: x['completion'], reverse=True)
+        most_completed = sorted_ongoing[:5]
+        least_completed = sorted_ongoing[-5:] if sorted_ongoing else []
+
+        # Series status counts
+        completed_count = watched
+        ongoing_count = len(ongoing_only)
+        not_started_count = sum(1 for s in series_with_progress if s['watched_episodes'] == 0)
         
         return {
             'total_series': total,
@@ -681,6 +705,9 @@ class IndexManager:
             'unwatched': unwatched,
             'watched_percentage': round((watched / total * 100), 2),
             'empty_series': empty_count,
+            'completed_count': completed_count,
+            'ongoing_count': ongoing_count,
+            'not_started_count': not_started_count,
             'average_completion': avg_completion,
             'total_episodes': total_episodes,
             'watched_episodes': watched_episodes,
@@ -998,7 +1025,7 @@ def _build_merged_data(old_data, new_dict, allowed):
     Returns:
         dict: merged series index.
     """
-    merged = dict(old_data)
+    merged = copy.deepcopy(old_data)
     for title, new_entry in new_dict.items():
         if title in merged:
             old_entry = merged[title]
@@ -1006,10 +1033,10 @@ def _build_merged_data(old_data, new_dict, allowed):
             for new_season in new_entry.get('seasons', []):
                 season_label = new_season.get('season')
                 if season_label in old_seasons:
-                    old_eps = {ep.get('number'): ep for ep in old_seasons[season_label].get('episodes', [])}
+                    old_eps = {str(ep.get('number')): ep for ep in old_seasons[season_label].get('episodes', [])}
                     merged_episodes = []
                     for new_ep in new_season.get('episodes', []):
-                        ep_num = new_ep.get('number')
+                        ep_num = str(new_ep.get('number'))
                         if ep_num in old_eps:
                             old_watched = old_eps[ep_num].get('watched', False)
                             new_watched = new_ep.get('watched', False)
@@ -1022,18 +1049,22 @@ def _build_merged_data(old_data, new_dict, allowed):
                         merged_episodes.append(new_ep)
                     old_seasons[season_label]['episodes'] = merged_episodes
                 else:
+                    # Validate watched status on new season's episodes
+                    validated_eps = []
+                    for ep in new_season.get('episodes', []):
+                        if ep.get('watched') is None:
+                            logger.error(f"Episode {ep.get('number')} in new season '{season_label}' "
+                                        f"for '{title}' has None watched status — dropping episode")
+                            continue
+                        validated_eps.append(ep)
+                    new_season['episodes'] = validated_eps
                     old_seasons[season_label] = new_season
             old_entry['seasons'] = list(old_seasons.values())
             # Recalculate counts from actual episode data
             old_entry['total_seasons'] = len(old_entry['seasons'])
-            old_entry['watched_episodes'] = sum(
-                sum(1 for ep in s.get('episodes', []) if ep.get('watched'))
-                for s in old_entry['seasons']
-            )
-            old_entry['total_episodes'] = sum(
-                len(s.get('episodes', []))
-                for s in old_entry['seasons']
-            )
+            total_eps, watched_eps = get_episode_counts(old_entry)
+            old_entry['watched_episodes'] = watched_eps
+            old_entry['total_episodes'] = total_eps
             old_entry['unwatched_episodes'] = old_entry['total_episodes'] - old_entry['watched_episodes']
             # Validate URLs before merging to reject malicious values
             new_url = new_entry.get('url', '')
@@ -1047,22 +1078,28 @@ def _build_merged_data(old_data, new_dict, allowed):
             elif new_link:
                 logger.warning(f"Rejected invalid link during merge for '{title}': {new_link[:80]}")
             if 'subscribed' in new_entry:
-                old_sub = old_entry.get('subscribed', False)
                 new_sub = new_entry['subscribed']
-                if old_sub != new_sub:
-                    if new_sub and allowed['subscribe']:
-                        old_entry['subscribed'] = True
-                    elif not new_sub and allowed['unsubscribe']:
-                        old_entry['subscribed'] = False
-                # If unchanged, keep as-is (no action needed)
+                if new_sub is None:
+                    logger.error(f"Ignoring None subscribed for existing entry '{title}' — keeping old value")
+                else:
+                    old_sub = old_entry.get('subscribed', False)
+                    if old_sub != new_sub:
+                        if new_sub and allowed['subscribe']:
+                            old_entry['subscribed'] = True
+                        elif not new_sub and allowed['unsubscribe']:
+                            old_entry['subscribed'] = False
+                    # If unchanged, keep as-is (no action needed)
             if 'watchlist' in new_entry:
-                old_wl = old_entry.get('watchlist', False)
                 new_wl = new_entry['watchlist']
-                if old_wl != new_wl:
-                    if new_wl and allowed['watchlist_add']:
-                        old_entry['watchlist'] = True
-                    elif not new_wl and allowed['watchlist_remove']:
-                        old_entry['watchlist'] = False
+                if new_wl is None:
+                    logger.error(f"Ignoring None watchlist for existing entry '{title}' — keeping old value")
+                else:
+                    old_wl = old_entry.get('watchlist', False)
+                    if old_wl != new_wl:
+                        if new_wl and allowed['watchlist_add']:
+                            old_entry['watchlist'] = True
+                        elif not new_wl and allowed['watchlist_remove']:
+                            old_entry['watchlist'] = False
             if allowed['title_ger'] and 'title_ger' in new_entry:
                 old_entry['title_ger'] = new_entry['title_ger']
             if allowed['title_eng'] and 'title_eng' in new_entry:
@@ -1074,6 +1111,9 @@ def _build_merged_data(old_data, new_dict, allowed):
             old_entry['alt_titles'] = combined
             old_entry['empty'] = old_entry['total_episodes'] == 0
             old_entry['last_updated'] = datetime.now().isoformat()
+            # Ensure subscribed/watchlist always present (legacy entries may lack them)
+            old_entry.setdefault('subscribed', False)
+            old_entry.setdefault('watchlist', False)
             # Reorder keys: metadata first, then seasons
             merged[title] = {
                 'url': old_entry.get('url', ''),
@@ -1081,9 +1121,13 @@ def _build_merged_data(old_data, new_dict, allowed):
                 'subscribed': old_entry.get('subscribed', False),
                 'watchlist': old_entry.get('watchlist', False),
                 'title': old_entry.get('title', title),
+                'title_ger': old_entry.get('title_ger', ''),
+                'title_eng': old_entry.get('title_eng', ''),
                 'alt_titles': old_entry.get('alt_titles', []),
+                'total_seasons': len(old_entry.get('seasons', [])),
                 'total_episodes': old_entry.get('total_episodes', 0),
                 'watched_episodes': old_entry.get('watched_episodes', 0),
+                'unwatched_episodes': old_entry.get('unwatched_episodes', 0),
                 'empty': old_entry.get('empty', False),
                 'added_date': old_entry.get('added_date', ''),
                 'last_updated': old_entry.get('last_updated', ''),
@@ -1094,17 +1138,45 @@ def _build_merged_data(old_data, new_dict, allowed):
             # Do not default subscribed/watchlist to False — if they are missing
             # (None), the series should have been filtered out by _finalize_series_data.
             # Only set default if the key is truly absent (legacy data).
+            # Also reject entries where the value is explicitly None — that means
+            # the scraper could not determine the status.
             if 'subscribed' not in new_entry:
                 logger.warning(f"New entry '{title}' missing 'subscribed' field — setting to False")
                 new_entry['subscribed'] = False
+            elif new_entry['subscribed'] is None:
+                logger.error(f"Rejecting new entry '{title}': subscribed is None (scrape failed)")
+                continue
             if 'watchlist' not in new_entry:
                 logger.warning(f"New entry '{title}' missing 'watchlist' field — setting to False")
                 new_entry['watchlist'] = False
+            elif new_entry['watchlist'] is None:
+                logger.error(f"Rejecting new entry '{title}': watchlist is None (scrape failed)")
+                continue
             new_entry.setdefault('alt_titles', [])
             new_entry['added_date'] = datetime.now().isoformat()
-            seasons = new_entry.pop('seasons', [])
-            new_entry['seasons'] = seasons
-            merged[title] = new_entry
+            new_entry['last_updated'] = datetime.now().isoformat()
+            # Calculate counts from episode data
+            seasons = new_entry.get('seasons', [])
+            total_eps, watched_eps = get_episode_counts(new_entry)
+            # Build with same schema as existing entries
+            merged[title] = {
+                'url': new_entry.get('url', ''),
+                'link': new_entry.get('link', ''),
+                'subscribed': new_entry['subscribed'],
+                'watchlist': new_entry['watchlist'],
+                'title': new_entry.get('title', title),
+                'title_ger': new_entry.get('title_ger', ''),
+                'title_eng': new_entry.get('title_eng', ''),
+                'alt_titles': new_entry.get('alt_titles', []),
+                'total_seasons': len(seasons),
+                'total_episodes': total_eps,
+                'watched_episodes': watched_eps,
+                'unwatched_episodes': total_eps - watched_eps,
+                'empty': total_eps == 0,
+                'added_date': new_entry.get('added_date', ''),
+                'last_updated': new_entry.get('last_updated', ''),
+                'seasons': seasons,
+            }
 
     return merged
 
